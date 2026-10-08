@@ -25,6 +25,8 @@ Paramètres en haut de `main.py` :
   et règles de marge. Ajouter une entrée pour chaque nouvelle paire.
 - Le levier maximum est calculé depuis `initialMarginFraction` : ×20 pour NVDA.
   Le bot attend la confirmation du changement avant de placer ses ordres.
+  Si `setLeverage` renvoie `ACK`, il vérifie le levier effectif via
+  `accountAttributeUpdates` (jusqu'à 10 secondes), même sans position ouverte.
 - `BOOK_LEVELS=5`, `MIN_SIDE_SHARE=0.20` : liquidité mesurée en notionnel sur les
   cinq meilleurs niveaux, en retirant les propres ordres actifs du bot.
   Un côté sous 20 % de la liquidité totale est désactivé : bids faibles →

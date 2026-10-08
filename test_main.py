@@ -1,7 +1,7 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -65,6 +65,45 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     def event(self, channel, contents, snapshot=False):
         self.bot.update({"channel": channel, "contents": contents, "accountIndex": 0,
                          "type": "subscribed" if snapshot else "channel_data"})
+
+    async def test_leverage_ack_waits_for_effective_leverage(self):
+        self.bot.post = AsyncMock(return_value={"status": "ACK", "leverage": 20})
+        task = asyncio.create_task(self.bot.set_leverage(self.market, 20))
+        await asyncio.sleep(0.01)
+        self.assertFalse(task.done())
+        self.event("accountAttributeUpdates", {"entries": [
+            {"type": "leverage", "marketId": 28, "leverage": 10}]})
+        await asyncio.sleep(0.01)
+        self.assertFalse(task.done())
+        self.event("accountAttributeUpdates", {"entries": [
+            {"type": "leverage", "marketId": 28, "leverage": 20}]})
+        await task
+        self.assertFalse(self.market.quotes)
+
+    async def test_leverage_confirmation_before_ack(self):
+        async def post(*args):
+            self.event("accountAttributeUpdates", {"entries": [
+                {"type": "leverage", "marketId": 28, "leverage": "20"}]})
+            return {"status": "ACK", "leverage": 20}
+        self.bot.post = post
+        await self.bot.set_leverage(self.market, 20)
+
+    async def test_leverage_applied_and_rejected(self):
+        self.bot.post = AsyncMock(return_value={"status": "APPLIED", "leverage": 20})
+        await self.bot.set_leverage(self.market, 20)
+        self.bot.post = AsyncMock(return_value={"status": "REJECTED", "leverage": 10})
+        with self.assertRaises(RuntimeError):
+            await self.bot.set_leverage(self.market, 20)
+        with self.assertRaisesRegex(RuntimeError, "UNDERCOLLATERALIZED"):
+            self.event("accountAttributeUpdates", {"entries": [
+                {"type": "leverageReject", "marketId": 28, "rejectReason": "UNDERCOLLATERALIZED"}]})
+
+    async def test_leverage_ack_timeout(self):
+        self.bot.post = AsyncMock(return_value={"status": "ACK", "leverage": 20})
+        with patch("main.REQUEST_TIMEOUT", 0.01):
+            with self.assertRaisesRegex(TimeoutError, "non confirmé"):
+                await self.bot.set_leverage(self.market, 20)
+        self.assertFalse(self.market.quotes)
 
     async def test_snapshots_ignore_closed_orders(self):
         self.event("orders", {"openOrders": [], "recentClosedOrders": [{"marketId": 28}]}, True)

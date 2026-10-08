@@ -61,6 +61,8 @@ class Market:
     orders_ready: bool = False
     positions_ready: bool = False
     quotes: dict = field(default_factory=dict)
+    leverage: Decimal | None = None
+    leverage_changed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 def desired_quote(market, side):
@@ -159,7 +161,17 @@ class Bot:
             return
         if msg["accountIndex"] != ACCOUNT_INDEX:
             return
-        if channel == "positions":
+        if channel == "accountAttributeUpdates":
+            for entry in contents["entries"]:
+                market = self.by_id.get(int(entry.get("marketId", -1)))
+                if market is None:
+                    continue
+                if entry["type"] == "leverageReject":
+                    raise RuntimeError(f"Changement de levier refusé : {entry}")
+                if entry["type"] == "leverage":
+                    market.leverage = D(str(entry["leverage"]))
+                    market.leverage_changed.set()
+        elif channel == "positions":
             snapshot = msg["type"] == "subscribed" or contents.get("isSnapshot")
             sequence = int(contents["lastSequenceId"])
             rows = contents.get("positions")
@@ -235,6 +247,25 @@ class Bot:
         # Un ACK ne suffit pas : attendre la fin réelle avant de replacer.
         await asyncio.wait_for(quote.terminal.wait(), REQUEST_TIMEOUT)
 
+    async def set_leverage(self, market, leverage):
+        result = await self.post("setLeverage", self.body(market, leverage=leverage))
+        status = result.get("status")
+        if status not in ("APPLIED", "ACK") or D(str(result["leverage"])) != leverage:
+            raise RuntimeError(f"Levier non confirmé : {result}")
+        if status == "ACK":
+            # ACK confirme la réception ; le flux indique le levier effectif.
+            # La valeur peut déjà être confirmée (snapshot ou événement avant ACK).
+            async def wait_for_leverage():
+                while market.leverage != leverage:
+                    market.leverage_changed.clear()
+                    await market.leverage_changed.wait()
+            try:
+                await asyncio.wait_for(wait_for_leverage(), REQUEST_TIMEOUT)
+            except TimeoutError as exc:
+                raise TimeoutError(f"Levier x{leverage} non confirmé sur "
+                                   f"{market.info['marketDisplayName']} après {REQUEST_TIMEOUT}s") from exc
+        log.info("%s levier x%s confirmé", market.info["marketDisplayName"], leverage)
+
     async def run_strategy(self):
         deadline = time.monotonic() + REQUEST_TIMEOUT
         while not all(m.orders_ready and m.positions_ready and m.book for m in self.markets.values()):
@@ -243,10 +274,7 @@ class Bot:
             await asyncio.sleep(0.05)
         for market in self.markets.values():
             leverage = int(D("1") / D(market.info["initialMarginFraction"]))
-            result = await self.post("setLeverage", self.body(market, leverage=leverage))
-            if result.get("status") != "APPLIED" or int(result["leverage"]) != leverage:
-                raise RuntimeError(f"Levier non confirmé : {result}")
-            log.info("%s levier x%s", market.info["marketDisplayName"], leverage)
+            await self.set_leverage(market, leverage)
         refresh_at = 0
         while True:
             now = time.monotonic()
@@ -279,7 +307,7 @@ class Bot:
             receiver = asyncio.create_task(self.receive())
             strategy = None
             try:
-                for channel in ("orders", "positions"):
+                for channel in ("orders", "positions", "accountAttributeUpdates"):
                     await self.ws.send(canonical({"type": "subscribe", "channel": channel,
                                                 "id": self.address, "accountIndex": ACCOUNT_INDEX}))
                 for symbol in self.markets:
