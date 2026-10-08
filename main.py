@@ -149,11 +149,27 @@ class Bot:
                 raise RuntimeError(f"Flux Arcus indisponible : {msg}")
             if msg.get("type") not in ("subscribed", "channel_data"):
                 continue
-            self.update(msg)
+            try:
+                self.update(msg)
+            except Exception:
+                log.exception("Erreur de traitement du canal %s (contents=%s)",
+                              msg.get("channel"), type(msg.get("contents")).__name__)
+                raise
         raise ConnectionError("WebSocket fermé")
 
     def update(self, msg):
         channel, contents = msg["channel"], msg["contents"]
+        if isinstance(contents, list):
+            if channel == "positions":
+                contents = {"positions": contents}
+            elif channel == "accountAttributeUpdates":
+                contents = {"entries": contents}
+            elif channel == "orders" and msg["type"] == "channel_data":
+                for row in contents:
+                    self.update({**msg, "contents": row})
+                return
+        if not isinstance(contents, dict):
+            raise ValueError(f"Format inattendu pour {channel}: {type(contents).__name__}")
         if channel == "l2Orderbook":
             market = self.markets[msg["id"]]
             market.book = contents
@@ -173,13 +189,27 @@ class Bot:
                     market.leverage_changed.set()
         elif channel == "positions":
             snapshot = msg["type"] == "subscribed" or contents.get("isSnapshot")
-            sequence = int(contents["lastSequenceId"])
             rows = contents.get("positions")
             if rows is None:
                 # Certaines versions de l'API émettent la ligne directement.
                 rows = {str(contents["marketId"]): contents}
+            elif isinstance(rows, list):
+                rows = {str(row["marketId"]): row for row in rows}
+            if not isinstance(rows, dict):
+                raise ValueError("positions doit être une liste ou un dictionnaire")
             for market_id, market in self.by_id.items():
                 row = rows.get(str(market_id))
+                if not snapshot and row is None:
+                    continue
+                sequence = contents.get("lastSequenceId")
+                if sequence is None and row is not None:
+                    sequence = row.get("sequenceNumber")
+                if sequence is None:
+                    if snapshot and row is None and not market.positions_ready:
+                        sequence = -1  # Snapshot initial vide, aucune position.
+                    else:
+                        raise ValueError(f"Séquence manquante sur positions pour le marché {market_id}")
+                sequence = int(sequence)
                 if (snapshot or row is not None) and sequence >= market.position_sequence:
                     market.position = D(row["size"]) if row else D("0")
                     market.position_sequence = sequence
@@ -324,6 +354,8 @@ class Bot:
                         await strategy
                 for market in self.markets.values():
                     for quote in list(market.quotes.values()):
+                        if quote.terminal.is_set():
+                            continue
                         try:
                             if receiver.done():
                                 raise ConnectionError("Flux arrêté")

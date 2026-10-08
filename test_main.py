@@ -117,6 +117,37 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             self.event("orders", {"openOrders": [{"marketId": 28, "status": "OPEN"}]}, True)
 
+    async def test_positions_list_after_fill(self):
+        q = Quote("own", "BUY", D("100"), D("0.1"))
+        self.market.quotes["BUY"] = q
+        self.event("orders", {"marketId": 28, "side": "BUY", "clientId": "own",
+                              "remainingSize": "0", "status": "FILLED", "sequenceNumber": 8})
+        self.event("positions", {"isSnapshot": False, "lastSequenceId": 8,
+                                 "positions": [{"marketId": 28, "size": "0.1"}]})
+        self.assertEqual(self.market.position, D("0.1"))
+        self.assertGreaterEqual(self.market.position_sequence, self.market.fill_sequence)
+        self.event("positions", {"lastSequenceId": 7,
+                                 "positions": [{"marketId": 28, "size": "0.2"}]})
+        self.assertEqual(self.market.position, D("0.1"))
+        self.event("positions", [{"marketId": 28, "size": "0", "sequenceNumber": 9}])
+        self.assertEqual(self.market.position, D("0"))
+        self.assertEqual(self.market.position_sequence, 9)
+
+    async def test_positions_list_snapshot_and_unrelated_delta(self):
+        self.event("positions", {"lastSequenceId": 4, "positions": []}, True)
+        self.assertTrue(self.market.positions_ready)
+        self.event("positions", {"lastSequenceId": 5,
+                                 "positions": [{"marketId": 28, "size": "-0.1"}]}, True)
+        self.event("positions", {"lastSequenceId": 6,
+                                 "positions": [{"marketId": 1, "size": "1"}]})
+        self.assertEqual(self.market.position, D("-0.1"))
+        self.assertEqual(self.market.position_sequence, 5)
+
+    async def test_positions_without_sequence_fail_explicitly(self):
+        with self.assertRaisesRegex(ValueError, "Séquence manquante"):
+            self.event("positions", {"positions": [{"marketId": 28, "size": "0.1"}]})
+        self.assertFalse(self.market.positions_ready)
+
     async def test_fill_and_position_sequence_gate(self):
         q = Quote("own", "BUY", D("100"), D("0.1"))
         self.market.quotes["BUY"] = q
