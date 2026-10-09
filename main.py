@@ -18,7 +18,7 @@ D = Decimal
 BASE_URL = "https://api.arcus.xyz"
 ACCOUNT_INDEX = int(os.getenv("ARCUS_ACCOUNT_INDEX", "0"))
 # Montants NOTIONNELS en USD, indépendants de la marge et du levier.
-PAIRS = {"NVDA-USD": {"order_usd": D("10"), "max_position_usd": D("40")}}
+PAIRS = {"SLV-USD": {"order_usd": D("10"), "max_position_usd": D("40")}}
 BOOK_LEVELS = 5
 MIN_SIDE_SHARE = D("0.20")
 MAX_BOOK_AGE = 2.0
