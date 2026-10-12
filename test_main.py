@@ -55,13 +55,23 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(relative_gap(D(".008"), D(".01")), D(".2"))
         self.assertEqual(relative_gap(D(0), D(0)), 0)
 
-    def test_four_hours_required(self):
+    def test_first_eligible_sample_is_immediately_ranked(self):
         samples = []
-        for now in range(0, 14401, 30):
-            update_history(samples, now, D(".00001"), D(".00002"))
-            if now < 14400:
-                self.assertIsNone(funding_score(samples, now))
-        self.assertIsNotNone(funding_score(samples, 14400))
+        update_history(samples, 0, D(".00001"), D(".00002"))
+        self.assertIsNotNone(funding_score(samples, 0))
+        update_history(samples, 30, D(".00002"), D(".00001"))
+        self.assertEqual(len(samples), 1)
+        self.assertIsNotNone(funding_score(samples, 30))
+        self.assertIsNone(funding_score([], 0))
+
+    def test_spread_limit_on_each_exchange_and_boundary(self):
+        a, e = market_info()
+        boundary = {"bids": [(D("99.985"), D(10))], "asks": [(D("100.015"), D(10))]}
+        self.assertGreater(entry_plan(a, e, (boundary, boundary), 1), 0)
+        wide = {"bids": [(D("99.984"), D(10))], "asks": [(D("100.016"), D(10))]}
+        for books in ((wide, book()), (book(), wide)):
+            with self.assertRaisesRegex(ValueError, "Spread"):
+                entry_plan(a, e, books, 1)
 
     def test_history_resets_on_inversion_low_gap_and_missing_data(self):
         for now, a, b in ((30, ".02", ".01"), (30, ".01", ".011"), (100, ".01", ".02")):
@@ -399,6 +409,27 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "CANCELED")
         self.assertEqual(adapter.positions.call_count, 2)
 
+    async def test_wide_spread_rejects_entry_on_both_adapters(self):
+        wide = {"bids": [(D("99"), D(10))], "asks": [(D("101"), D(10))]}
+        for adapter in (self.adapter(), Arcus.__new__(Arcus)):
+            adapter.info = {"NVDA-USD": market_info()[0 if isinstance(adapter, Arcus) else 1]}
+            adapter.markets = AsyncMock(return_value=[market_info()[0]])
+            adapter.positions = AsyncMock(return_value={})
+            adapter.book = AsyncMock(return_value=wide)
+            with self.assertRaisesRegex(ValueError, "Spread"):
+                await adapter.order("NVDA-USD", 1 if isinstance(adapter, Arcus) else -1, D(".99"))
+            if isinstance(adapter, Lighter):
+                adapter.signer.create_order.assert_not_called()
+
+    async def test_reduce_only_ignores_wide_spread(self):
+        adapter = self.adapter()
+        adapter.positions = AsyncMock(side_effect=[{"NVDA-USD": position("-.99")}, {}])
+        adapter.book = AsyncMock(return_value={"bids": [(D("99"), D(10))], "asks": [(D("101"), D(10))]})
+        adapter.confirm = AsyncMock(return_value={"status": "FILLED", "filledSize": ".99"})
+        await adapter.order("NVDA-USD", 1, D(".99"), reduce_only=True)
+        self.assertTrue(adapter.signer.create_order.call_args.kwargs["reduce_only"])
+        adapter.stats.assert_not_called()
+
     async def test_send_timeout_reconciles_without_resubmitting(self):
         adapter = self.adapter()
         adapter.signer.create_order.side_effect = TimeoutError()
@@ -504,6 +535,13 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
     setUp = LifecycleTests.setUp
     tearDown = LifecycleTests.tearDown
     open = LifecycleTests.open
+
+    async def test_scan_can_open_on_first_observation(self):
+        with patch("main.time.time", return_value=100):
+            await self.farmer.scan()
+        self.assertEqual(self.farmer.state["active"]["NVDA-USD"]["phase"], "open")
+        self.assertEqual(len(self.a.orders), 1)
+        self.assertEqual(len(self.e.orders), 1)
 
     async def test_fresh_oracle_rejects_before_any_order(self):
         self.a.info["oraclePrice"] = "99"

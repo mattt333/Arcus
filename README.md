@@ -81,15 +81,16 @@ enregistrées dans son journal.
   `market_stats/all`). Un taux positif est payé par les longs.
   Shorter le taux le plus élevé et longer le plus faible, même si les deux
   sont négatifs.
-- Écart relatif : `abs(Lighter - Arcus) / max(abs(Lighter), abs(Arcus))`.
-  Il doit rester ≥20 %, dans le même sens, pendant 4 heures d'observation.
-  Mesure toutes les 30 secondes. Une inversion, un seuil non satisfait ou
-  une interruption de données >90 secondes réinitialise l'observation.
+- Ecart relatif : `abs(Lighter - Arcus) / max(abs(Lighter), abs(Arcus))`.
+  Il doit etre >=20 %. L'entree est eligible des la premiere observation,
+  sans attendre 4 heures. Mesure toutes les 30 secondes. L'historique de
+  classement conserve jusqu'a 4 heures de donnees ; il ne bloque pas l'entree.
+  Une inversion ou une interruption >90 secondes reinitialise cet historique.
 - Classement : écart horaire moyen divisé par `1 + écart-type / moyenne`.
   Le score privilégie les écarts élevés et réguliers observés ; il ne prédit
   pas les fundings futurs ni le rendement net de frais.
-- Spread bid/ask ≤0,05 % sur chaque plateforme et écart entre les prix
-  exécutables des deux jambes ≤0,05 %. Vérifier la profondeur pour la quantité
+- Spread bid/ask ≤0,03 % sur chaque plateforme et écart entre les prix
+  exécutables des deux jambes ≤0,03 %. Vérifier la profondeur pour la quantité
   entière et relire le carnet juste avant ouverture.
 - Avant chaque entrée : **long si mark < oracle ; short si mark > oracle**
   sur chaque jambe. Refuser l'entrée si les prix sont égaux, invalides ou
@@ -139,6 +140,12 @@ et le champ `liquidation_price` du compte pour les contrôles de risque.
 Les gaps de prix et indisponibilités peuvent
 empêcher une fermeture avant liquidation.
 
+Le filtre de spread est verifie sur les deux carnets avant ouverture, puis
+sur le carnet frais de chaque jambe juste avant son ordre. Il ne s'applique
+pas aux clotures reduce-only. `STABILITY_HOURS` n'est plus utilise, meme si
+cette variable est encore definie sur le serveur. Un ancien `MAX_SPREAD`
+superieur a `0.0003` ne permet pas de depasser le plafond de 0,03 %.
+
 Les fermetures acceptent jusqu'à 2 % de slippage et peuvent être partielles.
 Vérifier la position résiduelle et tenter jusqu'à cinq fermetures reduce-only.
 Une plateforme en erreur ne doit pas empêcher une tentative sur l'autre.
@@ -183,8 +190,7 @@ et ce journal.
 | `POSITION_USD` | `100` | Notionnel maximal par jambe |
 | `MAX_PAIRS` | `2` | Nombre maximal de paires ouvertes |
 | `MIN_FUNDING_GAP` | `0.20` | Écart relatif de funding |
-| `STABILITY_HOURS` | `4` | Durée continue d'observation |
-| `MAX_SPREAD` | `0.0005` | Seuil de spread et écart d'exécution |
+| `MAX_SPREAD` | `0.0003` | Seuil relatif (0,03 %), plafond strict ; configurable uniquement plus bas |
 | `STATE_FILE` | `funding-state.json` | Fichier d'état |
 | `ARCUS_BASE_URL` | `https://api.arcus.xyz` | API Arcus mainnet uniquement |
 | `LIGHTER_BASE_URL` | `https://api.rh.lighter.xyz` | API Robinhood Chain mainnet uniquement |

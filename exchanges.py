@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 D = Decimal
 TIMEOUT = 10
 ORDER_TIMEOUT = 20
+MAX_SPREAD = min(D(os.getenv("MAX_SPREAD", "0.0003")), D("0.0003"))  # 0,03 % maximum
 OPEN_SLIPPAGE = D("0.0005")
 CLOSE_SLIPPAGE = D("0.02")
 TERMINAL = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "MARGIN_CANCELED"}
@@ -29,6 +30,15 @@ def check_oracle(mark, oracle, side):
     if (mark - oracle) * side >= 0:
         raise ValueError("Mark/oracle défavorable : long exige mark < oracle, short exige mark > oracle")
 
+
+
+def check_book_spread(book):
+    if not book["bids"] or not book["asks"]:
+        raise ValueError("Carnet vide")
+    bid, ask = book["bids"][0][0], book["asks"][0][0]
+    if (not bid.is_finite() or not ask.is_finite() or bid <= 0 or ask < bid
+            or (ask - bid) / ((ask + bid) / 2) > MAX_SPREAD):
+        raise ValueError("Spread bid/ask trop large : maximum 0,03 %")
 
 
 def canonical(body):
@@ -193,6 +203,8 @@ class Arcus:
         before = (await self.positions()).get(name)
         before_size = before["size"] if before else D(0)
         book = await self.book(name)
+        if not reduce_only:
+            check_book_spread(book)
         levels = book["asks" if side == 1 else "bids"]
         if not levels:
             raise ValueError("Carnet Arcus vide")
@@ -442,7 +454,10 @@ class Lighter:
         market = self.info[name]
         before = (await self.positions()).get(name)
         before_size = before["size"] if before else D(0)
-        levels = (await self.book(name))["asks" if side == 1 else "bids"]
+        book = await self.book(name)
+        if not reduce_only:
+            check_book_spread(book)
+        levels = book["asks" if side == 1 else "bids"]
         if not levels:
             raise ValueError("Carnet Lighter vide")
         price = snap(levels[0][0] * (1 + side * (CLOSE_SLIPPAGE if reduce_only else OPEN_SLIPPAGE)),

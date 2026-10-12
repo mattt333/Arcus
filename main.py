@@ -11,14 +11,13 @@ import uuid
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
-from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_position, check_oracle
+from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_position, check_oracle, check_book_spread, MAX_SPREAD
 
 D = Decimal
 POSITION_USD = D(os.getenv("POSITION_USD", "100"))
 MAX_PAIRS = int(os.getenv("MAX_PAIRS", "2"))
 MIN_FUNDING_GAP = D(os.getenv("MIN_FUNDING_GAP", "0.20"))
-MAX_SPREAD = D(os.getenv("MAX_SPREAD", "0.0005"))  # 0,05 %
-STABILITY_HOURS = float(os.getenv("STABILITY_HOURS", "4"))
+HISTORY_SECONDS = 4 * 3600  # Fen?tre de classement, sans attente avant entr?e.
 MAX_PRICE_MOVE = D("0.10")
 LIQUIDATION_BUFFER = D("0.10")  # 10 % du trajet entrée -> liquidation restant.
 SCAN_SECONDS = 30
@@ -59,7 +58,7 @@ def match_markets(arcus, lighter):
 
 
 def update_history(samples, now, a, b):
-    duration = STABILITY_HOURS * 3600
+    duration = HISTORY_SECONDS
     if samples and (now - samples[-1][0] > SCAN_SECONDS * 3 or now < samples[-1][0]):
         samples.clear()
     if relative_gap(a, b) < MIN_FUNDING_GAP or a == b:
@@ -73,7 +72,7 @@ def update_history(samples, now, a, b):
 
 
 def funding_score(samples, now):
-    if not samples or now - samples[0][0] < STABILITY_HOURS * 3600:
+    if not samples:
         return None
     gains = [float(abs(D(b) - D(a))) for _, a, b in samples]
     mean = statistics.fmean(gains)
@@ -95,11 +94,7 @@ def vwap(levels, quantity):
 def entry_plan(a, e, books, orientation):
     ab, eb = books
     for book in books:
-        if not book["bids"] or not book["asks"]:
-            raise ValueError("Carnet vide")
-        bid, ask = book["bids"][0][0], book["asks"][0][0]
-        if bid <= 0 or ask <= bid or (ask - bid) / ((ask + bid) / 2) > MAX_SPREAD:
-            raise ValueError("Spread bid/ask trop large")
+        check_book_spread(book)
     prices = (ab["asks" if orientation == 1 else "bids"][0][0],
               eb["bids" if orientation == 1 else "asks"][0][0])
     step = common_step(D(a["stepSize"]), D(e["stepSize"]))
@@ -315,7 +310,7 @@ class Farmer:
             return
         if (lr * D(e["markPrice"]) - ar * D(a["markPrice"])) * orientation <= 0:
             raise ValueError("Funding combine non positif avant entree")
-        reason = f"funding stable : Arcus={ar}/h, Lighter={lr}/h ; mark/oracle et liquidite valides"
+        reason = f"ecart de funding eligible : Arcus={ar}/h, Lighter={lr}/h ; mark/oracle et liquidite valides"
         trade = {"arcus": symbol, "lighter": e["name"], "quantity": str(quantity),
                  "orientation": orientation, "phase": "opening", "opened_at": time.time(),
                  "entry_reason": reason, "orders": [], "market_info": {"arcus": a, "lighter": e}}
@@ -403,8 +398,8 @@ class Farmer:
             if symbol not in self.pairs:
                 await self.close_pair(symbol, "marché ou funding devenu indisponible")
         self.save()
-        log.info("%s RWA communs ; %s paires ouvertes ; %s éligibles après %.1fh",
-                 len(self.pairs), len(self.state["active"]), len(ranked), STABILITY_HOURS)
+        log.info("%s RWA communs ; %s paires ouvertes ; %s eligibles sans delai d'observation",
+                 len(self.pairs), len(self.state["active"]), len(ranked))
         for score, symbol, orientation, a, e in sorted(ranked, reverse=True, key=lambda x: x[0]):
             if len(self.state["active"]) >= MAX_PAIRS or self.stop.is_set():
                 break
@@ -445,7 +440,7 @@ class Farmer:
 
 
 async def main():
-    if POSITION_USD <= 0 or MAX_PAIRS < 1 or STABILITY_HOURS <= 0 or MIN_FUNDING_GAP <= 0 or MAX_SPREAD <= 0:
+    if POSITION_USD <= 0 or MAX_PAIRS < 1 or MIN_FUNDING_GAP <= 0 or MAX_SPREAD <= 0:
         raise ValueError("Paramètres de stratégie invalides")
     async with Http() as http:
         lighter = Lighter(http)
