@@ -89,9 +89,11 @@ enregistrées dans son journal.
 - Classement : écart horaire moyen divisé par `1 + écart-type / moyenne`.
   Le score privilégie les écarts élevés et réguliers observés ; il ne prédit
   pas les fundings futurs ni le rendement net de frais.
-- Spread bid/ask ≤0,03 % sur chaque plateforme et écart entre les prix
-  exécutables des deux jambes ≤0,03 %. Vérifier la profondeur pour la quantité
-  entière et relire le carnet juste avant ouverture.
+- Spread bid/ask <=0,03 % sur chacun des deux exchanges, mesure par
+  `(ask - bid) / ((ask + bid) / 2)`. Aucun filtre sur l'ecart de prix entre
+  exchanges. Verifier la profondeur pour la quantite entiere et relire le
+  carnet juste avant ouverture. Le slippage de profondeur conserve son
+  seuil distinct de 0,05 % a l'entree.
 - Avant chaque entrée : **long si mark < oracle ; short si mark > oracle**
   sur chaque jambe. Refuser l'entrée si les prix sont égaux, invalides ou
   indisponibles. Ce contrôle ne garantit pas l'évolution future du funding.
@@ -190,7 +192,7 @@ et ce journal.
 | `POSITION_USD` | `100` | Notionnel maximal par jambe |
 | `MAX_PAIRS` | `2` | Nombre maximal de paires ouvertes |
 | `MIN_FUNDING_GAP` | `0.20` | Écart relatif de funding |
-| `MAX_SPREAD` | `0.0003` | Seuil relatif (0,03 %), plafond strict ; configurable uniquement plus bas |
+| `MAX_SPREAD` | `0.0003` | Spread bid/ask uniquement ; plafond 0,03 %, configurable plus bas |
 | `STATE_FILE` | `funding-state.json` | Fichier d'état |
 | `ARCUS_BASE_URL` | `https://api.arcus.xyz` | API Arcus mainnet uniquement |
 | `LIGHTER_BASE_URL` | `https://api.rh.lighter.xyz` | API Robinhood Chain mainnet uniquement |

@@ -11,7 +11,7 @@ import uuid
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
-from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_position, check_oracle, check_book_spread, MAX_SPREAD
+from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_position, check_oracle, check_book_spread, MAX_SPREAD, OPEN_SLIPPAGE
 
 D = Decimal
 POSITION_USD = D(os.getenv("POSITION_USD", "100"))
@@ -107,10 +107,8 @@ def entry_plan(a, e, books, orientation):
         raise ValueError("Taille non autorisée sur Lighter")
     fills = (vwap(ab["asks" if orientation == 1 else "bids"], quantity),
              vwap(eb["bids" if orientation == 1 else "asks"], quantity))
-    if abs(fills[0] - fills[1]) / ((fills[0] + fills[1]) / 2) > MAX_SPREAD:
-        raise ValueError("Écart de prix exécutables entre plateformes trop large")
     for price, fill in zip(prices, fills):
-        if abs(fill - price) / price > MAX_SPREAD:
+        if abs(fill - price) / price > OPEN_SLIPPAGE:
             raise ValueError("Slippage trop élevé")
     return quantity
 

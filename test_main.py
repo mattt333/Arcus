@@ -93,17 +93,31 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(quantity % D(a["stepSize"]), 0)
         self.assertEqual(quantity % D(e["stepSize"]), 0)
 
-    def test_spread_basis_and_depth_limits(self):
+    def test_spread_and_depth_limits(self):
         a, e = market_info()
         bad = book(); bad["asks"] = [(D("101"), D(10))]
         with self.assertRaisesRegex(ValueError, "Spread"):
             entry_plan(a, e, (bad, book()), 1)
-        bad = {"bids": [(D("101"), D(10))], "asks": [(D("101.01"), D(10))]}
-        with self.assertRaisesRegex(ValueError, "Écart"):
-            entry_plan(a, e, (book(), bad), 1)
         bad = book(); bad["asks"] = [(D("100.01"), D(".01"))]
         with self.assertRaisesRegex(ValueError, "Profondeur"):
             entry_plan(a, e, (bad, book()), 1)
+
+    def test_different_exchange_prices_are_allowed_in_both_directions(self):
+        a, e = market_info()
+        other = {"bids": [(D("101"), D(10))], "asks": [(D("101.01"), D(10))]}
+        for orientation in (1, -1):
+            self.assertGreater(entry_plan(a, e, (book(), other), orientation), 0)
+
+    def test_depth_slippage_uses_its_own_limit(self):
+        a, e = market_info()
+        for second_price, allowed in (("100.05", True), ("100.08", False)):
+            deep = book()
+            deep["asks"] = [(D("100.01"), D(".01")), (D(second_price), D(10))]
+            if allowed:
+                self.assertGreater(entry_plan(a, e, (deep, book()), 1), 0)
+            else:
+                with self.assertRaisesRegex(ValueError, "Slippage"):
+                    entry_plan(a, e, (deep, book()), 1)
 
     def test_crypto_and_different_underlyings_excluded(self):
         a, e = market_info()
