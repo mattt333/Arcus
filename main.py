@@ -1,397 +1,467 @@
-"""Market maker Arcus : un ordre post-only par côté et par marché."""
-
+"""Arbitrage de funding Arcus / Lighter, uniquement sur les RWA communs."""
 import asyncio
 import json
 import logging
+import math
 import os
-import re
+import signal
+import statistics
 import time
-import urllib.request
-from contextlib import suppress
-from dataclasses import dataclass, field
+import uuid
 from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
 
-import websockets
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_position, check_oracle
 
 D = Decimal
-BASE_URL = "https://api.arcus.xyz"
-ACCOUNT_INDEX = int(os.getenv("ARCUS_ACCOUNT_INDEX", "0"))
-# Montants NOTIONNELS en USD, indépendants de la marge et du levier.
-PAIRS = {"NVDA-USD": {"order_usd": D("10"), "max_position_usd": D("40")}}
-BOOK_LEVELS = 5
-MIN_SIDE_SHARE = D("0.20")
-MAX_BOOK_AGE = 2.0
-REQUEST_TIMEOUT = 10
-log = logging.getLogger("arcus")
+POSITION_USD = D(os.getenv("POSITION_USD", "100"))
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", "2"))
+MIN_FUNDING_GAP = D(os.getenv("MIN_FUNDING_GAP", "0.20"))
+MAX_SPREAD = D(os.getenv("MAX_SPREAD", "0.0005"))  # 0,05 %
+STABILITY_HOURS = float(os.getenv("STABILITY_HOURS", "4"))
+MAX_PRICE_MOVE = D("0.10")
+LIQUIDATION_BUFFER = D("0.10")  # 10 % du trajet entrée -> liquidation restant.
+SCAN_SECONDS = 30
+MONITOR_SECONDS = 2
+STATE_FILE = Path(os.getenv("STATE_FILE", "funding-state.json"))
+log = logging.getLogger("funding")
 
 
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+def common_step(a, b):
+    scale = D(10) ** max(-a.as_tuple().exponent, -b.as_tuple().exponent, 0)
+    return D(math.lcm(int(a * scale), int(b * scale))) / scale
 
 
-def ticks(value, unit):
-    result = D(value) / D(unit)
-    if result != result.to_integral_value():
-        raise ValueError(f"{value} n'est pas un multiple de {unit}")
-    return int(result)
+def direction(a, b):
+    """Positif = long Arcus, short Lighter ; taux horaires en fractions."""
+    return 1 if b > a else -1
 
 
-@dataclass
-class Quote:
-    client_id: str
-    side: str
-    price: Decimal
-    remaining: Decimal
-    status: str = "PENDING"
-    sequence: int = -1
-    created: float = field(default_factory=time.monotonic)
-    terminal: asyncio.Event = field(default_factory=asyncio.Event)
+def relative_gap(a, b):
+    divisor = max(abs(a), abs(b))
+    return abs(b - a) / divisor if divisor else D(0)
 
 
-@dataclass
-class Market:
-    info: dict
-    config: dict
-    book: dict = field(default_factory=dict)
-    book_time: float = 0
-    position: Decimal = D("0")
-    position_sequence: int = -1
-    fill_sequence: int = -1
-    orders_ready: bool = False
-    positions_ready: bool = False
-    quotes: dict = field(default_factory=dict)
-    leverage: Decimal | None = None
-    leverage_changed: asyncio.Event = field(default_factory=asyncio.Event)
+def match_markets(arcus, lighter):
+    result = {}
+    for a in arcus:
+        if a["category"] not in ("EQUITIES", "COMMODITIES") or a["status"] != "ONLINE":
+            continue
+        symbol = a["marketDisplayName"]
+        candidates = [e for e in lighter if e["name"] == symbol
+                      and e["market_type"] == "perp" and e["status"] == "active"
+                      and D(e["multiplier"]) == 1 and e["quote_multiplier"] == 1
+                      and not e.get("is_frozen")
+                      and not e.get("market_config", {}).get("force_reduce_only")]
+        if len(candidates) == 1:
+            result[symbol] = (a, candidates[0])
+    return result
 
 
-def desired_quote(market, side):
-    """Prix et quantité autorisés, ou None si le côté ne doit pas être coté."""
-    bids, asks = market.book.get("bids", []), market.book.get("asks", [])
-    if not bids or not asks or D(bids[0][0]) >= D(asks[0][0]):
+def update_history(samples, now, a, b):
+    duration = STABILITY_HOURS * 3600
+    if samples and (now - samples[-1][0] > SCAN_SECONDS * 3 or now < samples[-1][0]):
+        samples.clear()
+    if relative_gap(a, b) < MIN_FUNDING_GAP or a == b:
+        samples.clear()
+        return
+    if samples and direction(D(samples[-1][1]), D(samples[-1][2])) != direction(a, b):
+        samples.clear()
+    samples.append([now, str(a), str(b)])
+    while len(samples) > 1 and samples[1][0] <= now - duration:
+        samples.pop(0)
+
+
+def funding_score(samples, now):
+    if not samples or now - samples[0][0] < STABILITY_HOURS * 3600:
         return None
-    totals = {}
-    for name, levels, order_side in (("bid", bids, "BUY"), ("ask", asks, "SELL")):
-        quote = market.quotes.get(order_side)
-        total = D("0")
-        for price, size in levels[:BOOK_LEVELS]:
-            price, size = D(price), D(size)
-            # Nos propres ordres ne doivent pas masquer un côté sans liquidité.
-            if quote and quote.status == "OPEN" and quote.price == price:
-                size = max(D("0"), size - quote.remaining)
-            total += price * size
-        totals[name] = total
-    total = totals["bid"] + totals["ask"]
-    own = totals["bid" if side == "BUY" else "ask"]
-    if total == 0 or own == 0 or own / total < MIN_SIDE_SHARE:
-        return None
-    price = D((bids if side == "BUY" else asks)[0][0])
-    # On réserve aussi la place pour le remplissage intégral de l'ordre.
-    # Le plus élevé des deux prix évite de sous-estimer l'exposition au spread.
-    risk_price = max(D(bids[0][0]), D(asks[0][0]))
-    signed_position = market.position if side == "BUY" else -market.position
-    room = market.config["max_position_usd"] / risk_price - signed_position
-    step = D(market.info["stepSize"])
-    quantity = min(market.config["order_usd"] / price, room,
-                   D(market.info["maxOrderSize"]))
-    quantity = (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
-    if quantity < D(market.info["minOrderSize"]):
-        return None
-    if quantity * price < D(market.info["minOrderNotional"]):
-        return None
-    return price, quantity
+    gains = [float(abs(D(b) - D(a))) for _, a, b in samples]
+    mean = statistics.fmean(gains)
+    deviation = statistics.pstdev(gains)
+    return mean / (1 + deviation / mean) if mean else None
 
 
-class Bot:
-    def __init__(self, address, private_key, markets):
-        self.address = address.lower()
-        self.key = private_key
-        self.api_key = private_key.public_key().public_bytes_raw().hex()
-        self.markets = markets
-        self.by_id = {int(m.info["marketId"]): m for m in markets.values()}
-        self.pending = {}
-        self.request_id = 0
-        self.quote_id = 0
-        self.client_prefix = f"mm-{time.time_ns()}-"
-        self.ws = None
+def vwap(levels, quantity):
+    remaining, cost = quantity, D(0)
+    for price, size in levels:
+        take = min(remaining, size)
+        cost += price * take
+        remaining -= take
+        if remaining == 0:
+            return cost / quantity
+    raise ValueError("Profondeur insuffisante pour la taille demandée")
 
-    def body(self, market, **values):
-        return {"address": self.address, "accountIndex": ACCOUNT_INDEX,
-                "marketId": market.info["marketId"], **values}
 
-    async def post(self, method, body, typed=None, timestamp=None):
-        ts = timestamp or time.time_ns()
-        message = canonical(typed) if typed is not None else str(ts) + method + canonical(body)
-        self.request_id += 1
-        request_id = self.request_id
-        future = asyncio.get_running_loop().create_future()
-        self.pending[request_id] = future
+def entry_plan(a, e, books, orientation):
+    ab, eb = books
+    for book in books:
+        if not book["bids"] or not book["asks"]:
+            raise ValueError("Carnet vide")
+        bid, ask = book["bids"][0][0], book["asks"][0][0]
+        if bid <= 0 or ask <= bid or (ask - bid) / ((ask + bid) / 2) > MAX_SPREAD:
+            raise ValueError("Spread bid/ask trop large")
+    prices = (ab["asks" if orientation == 1 else "bids"][0][0],
+              eb["bids" if orientation == 1 else "asks"][0][0])
+    step = common_step(D(a["stepSize"]), D(e["stepSize"]))
+    quantity = (POSITION_USD / max(prices) / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if quantity <= 0 or quantity < max(D(a["minOrderSize"]), D(e["minOrderSize"])):
+        raise ValueError("Taille sous les minimums de marché")
+    if quantity > D(a["maxOrderSize"]) or quantity * min(prices) < D(a["minOrderNotional"]):
+        raise ValueError("Taille non autorisée sur Arcus")
+    if quantity * min(prices) < D(e["minOrderNotional"]) or quantity * max(prices) > D(e["maxOrderNotional"]):
+        raise ValueError("Taille non autorisée sur Lighter")
+    fills = (vwap(ab["asks" if orientation == 1 else "bids"], quantity),
+             vwap(eb["bids" if orientation == 1 else "asks"], quantity))
+    if abs(fills[0] - fills[1]) / ((fills[0] + fills[1]) / 2) > MAX_SPREAD:
+        raise ValueError("Écart de prix exécutables entre plateformes trop large")
+    for price, fill in zip(prices, fills):
+        if abs(fill - price) / price > MAX_SPREAD:
+            raise ValueError("Slippage trop élevé")
+    return quantity
+
+
+def risk_reason(position):
+    if position is None:
+        return "une jambe a disparu"
+    mark, entry, liquidation = (position[k] for k in ("mark", "entry", "liquidation"))
+    if mark <= 0 or entry <= 0:
+        return "prix de risque indisponible"
+    if abs(mark / entry - 1) >= MAX_PRICE_MOVE:
+        return "mouvement de prix de 10 %"
+    if liquidation is None:
+        return "prix de liquidation indisponible"
+    signed_distance = (mark - liquidation) * (1 if position["size"] > 0 else -1)
+    initial_distance = abs(entry - liquidation)
+    if initial_distance == 0 or signed_distance <= initial_distance * LIQUIDATION_BUFFER:
+        return "proximité de liquidation"
+    return None
+
+
+class Farmer:
+    def __init__(self, arcus, lighter, state_path=STATE_FILE):
+        self.arcus, self.lighter = arcus, lighter
+        self.path = state_path
+        owner = {"arcus": arcus.identity, "lighter": lighter.identity}
+        self.state = json.loads(self.path.read_text()) if self.path.exists() else {"owner": owner, "active": {}, "history": {}}
+        if self.state["owner"] != owner:
+            raise ValueError("Le journal appartient à d'autres comptes ou environnements")
+        for trade in self.state["active"].values():
+            for venue, exchange in (("arcus", arcus), ("lighter", lighter)):
+                if isinstance(exchange, (Arcus, Lighter)) and trade.get("market_info", {}).get(venue):
+                    exchange.info[trade[venue]] = trade["market_info"][venue]
+        self.pairs = {}
+        self.stop = asyncio.Event()
+
+    def save(self):
+        temporary = self.path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf8") as handle:
+            json.dump(self.state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Windows peut bri?vement retenir le fichier pendant une lecture/indexation.
+        for attempt in range(10):
+            try:
+                temporary.replace(self.path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 9:
+                    raise
+                time.sleep(0.02)
+
+    def audit(self, event, **fields):
+        record = {"timestamp": time.time(), "event": event, **fields}
+        with self.path.with_suffix(".orders.jsonl").open("a", encoding="utf8") as handle:
+            handle.write(json.dumps(record, default=str, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        log.info("%s", json.dumps(record, default=str, ensure_ascii=False))
+
+    async def place_order(self, exchange, market, side, quantity, reason, reduce_only=False, trade=None):
+        client_id = ("fund" + uuid.uuid4().hex if exchange.name == "Arcus"
+                     else str(uuid.uuid4().int % (2 ** 48 - 1) + 1))
+        reference = {"venue": exchange.name, "market": market, "client_id": client_id, "terminal": False,
+                     "side": side, "reduce_only": reduce_only}
+        if trade is not None:
+            trade.setdefault("orders", []).append(reference)
+            self.save()  # L'identifiant est durable AVANT transmission, y compris en fermeture.
+        self.audit("order_requested", venue=exchange.name, market=market, side=side,
+                   quantity=quantity, reduce_only=reduce_only, reason=reason, client_id=client_id)
         try:
-            await self.ws.send(canonical({"type": "post", "id": request_id, "request": {
-                "type": method, "payload": body, "apiKey": self.api_key,
-                "timestamp": str(ts), "signature": self.key.sign(message.encode()).hex()}}))
-            response = await asyncio.wait_for(future, REQUEST_TIMEOUT)
-            if response.get("error") or int(response["status"]) >= 400:
-                raise RuntimeError(f"{method}: {response.get('error', response.get('result'))}")
-            return response["result"]
-        finally:
-            self.pending.pop(request_id, None)
-
-    async def receive(self):
-        async for raw in self.ws:
-            msg = json.loads(raw)
-            if isinstance(msg.get("id"), int) and msg["id"] in self.pending:
-                future = self.pending[msg["id"]]
-                if not future.done():
-                    future.set_result(msg)
-                continue
-            if msg.get("type") in ("error", "degraded"):
-                raise RuntimeError(f"Flux Arcus indisponible : {msg}")
-            if msg.get("type") not in ("subscribed", "channel_data"):
-                continue
-            try:
-                self.update(msg)
-            except Exception:
-                log.exception("Erreur de traitement du canal %s (contents=%s)",
-                              msg.get("channel"), type(msg.get("contents")).__name__)
-                raise
-        raise ConnectionError("WebSocket fermé")
-
-    def update(self, msg):
-        channel, contents = msg["channel"], msg["contents"]
-        if isinstance(contents, list):
-            if channel == "positions":
-                contents = {"positions": contents}
-            elif channel == "accountAttributeUpdates":
-                contents = {"entries": contents}
-            elif channel == "orders" and msg["type"] == "channel_data":
-                for row in contents:
-                    self.update({**msg, "contents": row})
-                return
-        if not isinstance(contents, dict):
-            raise ValueError(f"Format inattendu pour {channel}: {type(contents).__name__}")
-        if channel == "l2Orderbook":
-            market = self.markets[msg["id"]]
-            market.book = contents
-            market.book_time = time.monotonic()
-            return
-        if msg["accountIndex"] != ACCOUNT_INDEX:
-            return
-        if channel == "accountAttributeUpdates":
-            for entry in contents["entries"]:
-                market = self.by_id.get(int(entry.get("marketId", -1)))
-                if market is None:
-                    continue
-                if entry["type"] == "leverageReject":
-                    raise RuntimeError(f"Changement de levier refusé : {entry}")
-                if entry["type"] == "leverage":
-                    market.leverage = D(str(entry["leverage"]))
-                    market.leverage_changed.set()
-        elif channel == "positions":
-            snapshot = msg["type"] == "subscribed" or contents.get("isSnapshot")
-            rows = contents.get("positions")
-            if rows is None:
-                # Certaines versions de l'API émettent la ligne directement.
-                rows = {str(contents["marketId"]): contents}
-            elif isinstance(rows, list):
-                rows = {str(row["marketId"]): row for row in rows}
-            if not isinstance(rows, dict):
-                raise ValueError("positions doit être une liste ou un dictionnaire")
-            for market_id, market in self.by_id.items():
-                row = rows.get(str(market_id))
-                if not snapshot and row is None:
-                    continue
-                sequence = contents.get("lastSequenceId")
-                if sequence is None and row is not None:
-                    sequence = row.get("sequenceNumber")
-                if sequence is None:
-                    if snapshot and row is None and not market.positions_ready:
-                        sequence = -1  # Snapshot initial vide, aucune position.
-                    else:
-                        raise ValueError(f"Séquence manquante sur positions pour le marché {market_id}")
-                sequence = int(sequence)
-                if (snapshot or row is not None) and sequence >= market.position_sequence:
-                    market.position = D(row["size"]) if row else D("0")
-                    market.position_sequence = sequence
-                    market.positions_ready = True
-        elif channel == "orders":
-            if msg["type"] == "subscribed" or contents.get("isSnapshot"):
-                for row in contents["openOrders"]:
-                    if int(row["marketId"]) in self.by_id and row["status"] in ("OPEN", "PARTIALLY_FILLED"):
-                        raise RuntimeError("Des ordres existent déjà sur une paire configurée. "
-                                           "Utiliser un sous-compte dédié et annuler ces ordres avant de lancer le bot.")
-                for market in self.markets.values():
-                    market.orders_ready = True
-                return
-            market = self.by_id.get(int(contents["marketId"]))
-            if market is None:
-                return
-            quote = market.quotes.get(contents["side"])
-            if quote is None or contents.get("clientId") != quote.client_id:
-                if contents.get("clientId", "").startswith(self.client_prefix):
-                    return  # Événement retardé d'un ordre déjà terminé.
-                raise RuntimeError("Ordre externe détecté sur une paire du bot : sous-compte dédié requis")
-            sequence = int(contents["sequenceNumber"])
-            if sequence <= quote.sequence:
-                return
-            remaining = D(contents["remainingSize"])
-            # Une annulation peut mettre remainingSize à zéro sans aucun fill.
-            if contents.get("positionEffect") or (remaining < quote.remaining and
-                                                   contents["status"] in ("OPEN", "FILLED")):
-                market.fill_sequence = max(market.fill_sequence, sequence)
-            quote.sequence = sequence
-            quote.remaining = remaining
-            quote.status = contents.get("state", contents["status"])
-            if quote.status in ("OPEN", "PARTIALLY_FILLED"):
-                quote.status = "OPEN"
+            result = await exchange.order(market, side, quantity, reduce_only=reduce_only, client_id=client_id)
+        except Exception as exc:
+            if isinstance(exc, UncertainOrder):
+                reference["client_id"] = exc.client_id
             else:
-                quote.terminal.set()
-            log.info("%s %s %s reste=%s %s", market.info["marketDisplayName"],
-                     quote.side, quote.status, remaining, contents.get("rejectionReason", ""))
+                reference["terminal"] = True  # Les adaptateurs n'ont pas transmis cet ordre.
+            if trade is not None:
+                self.save()
+            self.audit("order_failed", venue=exchange.name, market=market, reason=reason,
+                       client_id=reference["client_id"], error=str(exc))
+            raise
+        reference["terminal"] = result["status"] in TERMINAL
+        reference["filled_size"] = result.get("filledSize")
+        if trade is not None:
+            self.save()
+        self.audit("order_result", venue=exchange.name, market=market, reason=reason, result=result)
+        return result
 
-    async def place(self, market, side, price, quantity):
-        ts = time.time_ns()
-        expiry = ts // 1000 + 40 * 86400 * 1_000_000
-        self.quote_id += 1
-        client_id = f"{self.client_prefix}{self.quote_id}"
-        # Réserver avant l'envoi : le flux peut arriver avant la réponse RPC.
-        market.quotes[side] = Quote(client_id, side, price, quantity)
-        typed = {"ad": self.address, "ai": ACCOUNT_INDEX, "c": client_id,
-                 "ct": ts, "g": expiry * 1000, "m": market.info["marketId"],
-                 "op": 1, "p": ticks(price, market.info["tickSize"]),
-                 "q": ticks(quantity, market.info["stepSize"]), "r": 0,
-                 "s": 0 if side == "BUY" else 1, "t": 3, "v": 1}
-        await self.post("placeOrder", self.body(market, clientId=client_id,
-                        orderSide=side, orderType="LIMIT", price=str(price),
-                        quantity=str(quantity), timeInForce="ALO", goodTilTime=str(expiry),
-                        timestamp=ts), typed, ts)
+    async def positions(self):
+        results = await asyncio.gather(self.arcus.positions(), self.lighter.positions(), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
 
-    async def cancel(self, market, quote):
-        if quote.terminal.is_set():
-            return
-        ts = time.time_ns()
-        typed = {"ad": self.address, "ai": ACCOUNT_INDEX, "c": quote.client_id,
-                 "ct": ts, "m": market.info["marketId"], "op": 2, "v": 1}
-        await self.post("cancelOrder", self.body(market, kind="clientId",
-                        clientId=quote.client_id, timestamp=ts), typed, ts)
-        # Un ACK ne suffit pas : attendre la fin réelle avant de replacer.
-        await asyncio.wait_for(quote.terminal.wait(), REQUEST_TIMEOUT)
-
-    async def set_leverage(self, market, leverage):
-        result = await self.post("setLeverage", self.body(market, leverage=leverage))
-        status = result.get("status")
-        if status not in ("APPLIED", "ACK") or D(str(result["leverage"])) != leverage:
-            raise RuntimeError(f"Levier non confirmé : {result}")
-        if status == "ACK":
-            # ACK confirme la réception ; le flux indique le levier effectif.
-            # La valeur peut déjà être confirmée (snapshot ou événement avant ACK).
-            async def wait_for_leverage():
-                while market.leverage != leverage:
-                    market.leverage_changed.clear()
-                    await market.leverage_changed.wait()
+    async def close_pair(self, symbol, reason):
+        trade = self.state["active"][symbol]
+        trade["phase"] = "closing"
+        trade["close_reason"] = reason
+        self.save()
+        log.warning("Fermeture %s : %s", symbol, reason)
+        failures = []
+        reconciled_venues = set()
+        # Annuler/faire confirmer les placements incertains AVANT lecture des positions.
+        for reference in trade.get("orders", []):
+            if reference["terminal"]:
+                continue
+            exchange = self.arcus if reference["venue"] == "Arcus" else self.lighter
+            self.audit("cancel_requested", venue=exchange.name, market=reference["market"],
+                       client_id=reference["client_id"], reason=reason)
             try:
-                await asyncio.wait_for(wait_for_leverage(), REQUEST_TIMEOUT)
-            except TimeoutError as exc:
-                raise TimeoutError(f"Levier x{leverage} non confirmé sur "
-                                   f"{market.info['marketDisplayName']} après {REQUEST_TIMEOUT}s") from exc
-        log.info("%s levier x%s confirmé", market.info["marketDisplayName"], leverage)
+                row = await exchange.cancel_order(reference["market"], reference["client_id"])
+                reference["terminal"] = bool(row and row["status"] in TERMINAL)
+                reference["filled_size"] = row.get("filledSize") if row else None
+                self.save()
+                self.audit("cancel_result", venue=exchange.name, reason=reason, result=row)
+                if not reference["terminal"]:
+                    failures.append("Placement encore incertain")
+                else:
+                    reconciled_venues.add(exchange.name)
+            except Exception as exc:
+                failures.append(f"Placement encore incertain sur {exchange.name}: {exc}")
+                self.audit("cancel_failed", venue=exchange.name, reason=reason, error=str(exc))
 
-    async def run_strategy(self):
-        deadline = time.monotonic() + REQUEST_TIMEOUT
-        while not all(m.orders_ready and m.positions_ready and m.book for m in self.markets.values()):
-            if time.monotonic() > deadline:
-                raise TimeoutError("Snapshots initiaux manquants")
-            await asyncio.sleep(0.05)
-        for market in self.markets.values():
-            leverage = int(D("1") / D(market.info["initialMarginFraction"]))
-            await self.set_leverage(market, leverage)
-        refresh_at = 0
-        while True:
-            now = time.monotonic()
-            if any(now - m.book_time > MAX_BOOK_AGE for m in self.markets.values()):
-                raise TimeoutError("Carnet périmé : arrêt et annulation des ordres")
-            if now >= refresh_at:
-                for market in self.markets.values():
-                    await self.post("scheduleCancel", self.body(market, time=time.time_ns() // 1000 + 30_000_000))
-                refresh_at = time.monotonic() + 10
-            for market in self.markets.values():
-                for side in ("BUY", "SELL"):
-                    quote = market.quotes.get(side)
-                    if quote and quote.terminal.is_set():
-                        del market.quotes[side]
-                        quote = None
-                    target = desired_quote(market, side)
-                    stale = time.monotonic() - market.book_time > MAX_BOOK_AGE
-                    if quote:
-                        if quote.status == "PENDING" and time.monotonic() - quote.created > REQUEST_TIMEOUT:
-                            raise TimeoutError("Placement sans confirmation sur le flux orders")
-                        if stale or target is None or quote.price != target[0] or quote.remaining > target[1]:
-                            await self.cancel(market, quote)
-                    elif not stale and target and market.position_sequence >= market.fill_sequence:
-                        await self.place(market, side, *target)
-            await asyncio.sleep(0.05)
+        for exchange, market in ((self.arcus, trade["arcus"]), (self.lighter, trade["lighter"])):
+            if exchange.name in reconciled_venues and not failures:
+                expected = sum((r["side"] * D(r.get("filled_size") or 0)
+                                for r in trade["orders"] if r["venue"] == exchange.name), D(0))
+                try:
+                    await wait_position(exchange, market, expected)
+                except Exception as exc:
+                    failures.append(f"Read-model non reconcilie sur {exchange.name}: {exc}")
+
+        async def close_leg(exchange, market):
+            for attempt in range(5):
+                try:
+                    position = (await exchange.positions()).get(market)
+                    if position is None:
+                        return
+                    size = position["size"]
+                    self.audit("position_snapshot", venue=exchange.name, market=market,
+                               reason=reason, unrealized_pnl=(position["mark"] - position["entry"]) * size,
+                               funding=position.get("funding"), fees=position.get("fees"))
+                    await self.place_order(exchange, market, -1 if size > 0 else 1,
+                                           abs(size), reason, reduce_only=True, trade=trade)
+                except UncertainOrder:
+                    # Un reduce-only sans statut terminal reste durable : pas de renvoi.
+                    raise
+                except Exception as exc:
+                    log.error("Fermeture %s tentative %s : %s", exchange.name, attempt + 1, exc)
+                await asyncio.sleep(1)
+            if market in await exchange.positions():
+                raise RuntimeError(f"Exposition restante sur {exchange.name} {market}")
+
+        results = await asyncio.gather(close_leg(self.arcus, trade["arcus"]),
+                                       close_leg(self.lighter, trade["lighter"]), return_exceptions=True)
+        failures.extend(str(r) for r in results if isinstance(r, BaseException))
+        if failures or any(not r["terminal"] for r in trade.get("orders", [])):
+            raise RuntimeError("Fermeture incomplete ou placement encore incertain ; journal conserve : " + "; ".join(failures))
+        trade["closed_at"] = time.time()
+        reports = await asyncio.gather(self.arcus.accounting(trade["arcus"], trade["opened_at"], trade["closed_at"]),
+                                       self.lighter.accounting(trade["lighter"], trade["opened_at"], trade["closed_at"]),
+                                       return_exceptions=True)
+        pnl = {}
+        for exchange, report in zip((self.arcus, self.lighter), reports):
+            expected = sum((D(r.get("filled_size") or 0) for r in trade.get("orders", [])
+                            if r["venue"] == exchange.name), D(0))
+            if isinstance(report, BaseException) or D(report.get("filled_size", "0")) < expected:
+                pnl[exchange.name] = {"price_pnl": None, "funding": None, "fees": None, "net_pnl": None,
+                                      "status": "unavailable", "error": str(report) if isinstance(report, BaseException) else "Historique de fills incomplet"}
+            else:
+                pnl[exchange.name] = report
+        net = sum((D(r["net_pnl"]) for r in pnl.values()), D(0)) if all(r["net_pnl"] is not None for r in pnl.values()) else None
+        self.audit("pair_closed", symbol=symbol, reason=reason, pnl=pnl, net_pnl=net, trade=trade)
+        self.state.setdefault("closed", []).append({**trade, "symbol": symbol, "pnl": pnl, "net_pnl": str(net) if net is not None else None})
+        del self.state["active"][symbol]
+        self.state["history"].pop(symbol, None)
+        self.save()
+
+    async def open_pair(self, symbol, a, e, orientation, quantity):
+        await asyncio.gather(self.arcus.set_leverage(a), self.lighter.set_leverage(e))
+        # Relecture des taux ET des prix avant l'envoi, pas seulement des carnets.
+        am, lm = await asyncio.gather(self.arcus.markets(), self.lighter.markets())
+        fresh = match_markets(am, lm).get(symbol)
+        if fresh is None:
+            raise ValueError("Marche devenu indisponible avant entree")
+        a, e = fresh
+        ar, lr = D(a["nextFundingRate"]), D(e["fundingRate"])
+        if direction(ar, lr) != orientation or relative_gap(ar, lr) < MIN_FUNDING_GAP:
+            raise ValueError("Funding change avant entree")
+        check_oracle(a["markPrice"], a.get("oraclePrice", 0), orientation)
+        check_oracle(e["markPrice"], e.get("oraclePrice", 0), -orientation)
+        books = await asyncio.gather(self.arcus.book(symbol), self.lighter.book(e["name"]))
+        quantity = min(quantity, entry_plan(a, e, books, orientation))
+        if self.stop.is_set():
+            return
+        if (lr * D(e["markPrice"]) - ar * D(a["markPrice"])) * orientation <= 0:
+            raise ValueError("Funding combine non positif avant entree")
+        reason = f"funding stable : Arcus={ar}/h, Lighter={lr}/h ; mark/oracle et liquidite valides"
+        trade = {"arcus": symbol, "lighter": e["name"], "quantity": str(quantity),
+                 "orientation": orientation, "phase": "opening", "opened_at": time.time(),
+                 "entry_reason": reason, "orders": [], "market_info": {"arcus": a, "lighter": e}}
+        self.state["active"][symbol] = trade
+        self.save()
+        try:
+            # Lighter d'abord : une panne du hedge ne declenche aucun ordre Arcus.
+            await self.place_order(self.lighter, trade["lighter"], -orientation, quantity, reason, trade=trade)
+            q = (await self.lighter.positions()).get(trade["lighter"])
+            if not q or q["size"] != -quantity * orientation:
+                raise RuntimeError("Quantites executees non neutres : fill Lighter incomplet")
+            if risk_reason(q):
+                raise RuntimeError("Marge Lighter insuffisante apres ouverture")
+            if self.stop.is_set():
+                raise RuntimeError("Arret demande pendant ouverture")
+            # Le mark/oracle Arcus peut avoir change pendant le fill Lighter.
+            arcus_now = next(r for r in await self.arcus.markets() if r["marketDisplayName"] == symbol)
+            check_oracle(arcus_now["markPrice"], arcus_now.get("oraclePrice", 0), orientation)
+            await self.place_order(self.arcus, trade["arcus"], orientation, quantity, reason, trade=trade)
+            ap, lp = await self.positions()
+            p, q = ap.get(trade["arcus"]), lp.get(trade["lighter"])
+            if not p or not q or p["size"] != quantity * orientation or q["size"] != -quantity * orientation:
+                raise RuntimeError("Quantites executees non neutres")
+            if risk_reason(p) or risk_reason(q):
+                raise RuntimeError("Marge de securite insuffisante apres ouverture")
+        except Exception:
+            await self.close_pair(symbol, "hedge impossible ou remplissage incomplet")
+            raise
+        trade["phase"] = "open"
+        self.save()
+        self.audit("pair_opened", symbol=symbol, reason=reason, quantity=quantity,
+                   arcus_side=orientation, lighter_side=-orientation)
+
+    async def monitor(self):
+        ap, ep = await self.positions()
+        expected_a = {t["arcus"] for t in self.state["active"].values()}
+        expected_e = {t["lighter"] for t in self.state["active"].values()}
+        if set(ap) - expected_a or set(ep) - expected_e:
+            raise RuntimeError("Positions externes détectées : comptes dédiés requis")
+        for symbol, trade in list(self.state["active"].items()):
+            p, q = ap.get(trade["arcus"]), ep.get(trade["lighter"])
+            reason = risk_reason(p) or risk_reason(q)
+            if trade["phase"] != "open":
+                reason = "opération interrompue à terminer"
+            elif p and q and (p["size"] + q["size"] != 0 or p["size"] * trade["orientation"] <= 0):
+                reason = "couverture delta perdue"
+            if reason:
+                await self.close_pair(symbol, reason)
+        if len(self.state["active"]) > MAX_PAIRS:
+            ranked = sorted(self.state["active"], key=lambda symbol:
+                            funding_score(self.state["history"].get(symbol, []), time.time()) or 0)
+            for symbol in ranked[:len(self.state["active"]) - MAX_PAIRS]:
+                await self.close_pair(symbol, "réduction du nombre maximal de paires")
+
+    async def scan(self):
+        am, em = await asyncio.gather(self.arcus.markets(), self.lighter.markets())
+        self.pairs = match_markets(am, em)
+        if not self.pairs:
+            raise RuntimeError("Aucun contrat stock/commodity commun aux deux plateformes")
+        now = time.time()
+        ranked = []
+        for symbol, (a, e) in self.pairs.items():
+            # L'adaptateur Lighter a converti le pourcentage horaire en fraction.
+            ar, er = D(a["nextFundingRate"]), D(e["fundingRate"])
+            if not ar.is_finite() or not er.is_finite():
+                raise ValueError("Funding non fini")
+            samples = self.state["history"].setdefault(symbol, [])
+            update_history(samples, now, ar, er)
+            trade = self.state["active"].get(symbol)
+            if trade:
+                # À quantité égale, les paiements portent sur les notionnels
+                # propres à chaque plateforme, qui peuvent diverger en cours de vie.
+                gain_per_unit = (er * D(e["markPrice"])
+                                 - ar * D(a["markPrice"])) * trade["orientation"]
+                if gain_per_unit <= 0:
+                    await self.close_pair(symbol, "funding combiné nul ou inversé")
+                continue
+            score = funding_score(samples, now)
+            if score is not None:
+                ranked.append((score, symbol, direction(ar, er), a, e))
+        for symbol in list(self.state["history"]):
+            if symbol not in self.pairs:
+                del self.state["history"][symbol]
+        for symbol in list(self.state["active"]):
+            if symbol not in self.pairs:
+                await self.close_pair(symbol, "marché ou funding devenu indisponible")
+        self.save()
+        log.info("%s RWA communs ; %s paires ouvertes ; %s éligibles après %.1fh",
+                 len(self.pairs), len(self.state["active"]), len(ranked), STABILITY_HOURS)
+        for score, symbol, orientation, a, e in sorted(ranked, reverse=True, key=lambda x: x[0]):
+            if len(self.state["active"]) >= MAX_PAIRS or self.stop.is_set():
+                break
+            try:
+                books = await asyncio.gather(self.arcus.book(symbol), self.lighter.book(e["name"]))
+                quantity = entry_plan(a, e, books, orientation)
+            except ValueError as exc:
+                log.info("Ignoré %s : %s", symbol, exc)
+                continue
+            log.info("Candidat %s : score horaire %.6g", symbol, score)
+            try:
+                await self.open_pair(symbol, a, e, orientation, quantity)
+            except ValueError as exc:
+                log.info("Ignore %s : %s", symbol, exc)
 
     async def run(self):
-        url = BASE_URL.replace("https://", "wss://").replace("http://", "ws://") + "/v1/ws"
-        async with websockets.connect(url, max_queue=1024) as self.ws:
-            receiver = asyncio.create_task(self.receive())
-            strategy = None
-            try:
-                for channel in ("orders", "positions", "accountAttributeUpdates"):
-                    await self.ws.send(canonical({"type": "subscribe", "channel": channel,
-                                                "id": self.address, "accountIndex": ACCOUNT_INDEX}))
-                for symbol in self.markets:
-                    await self.ws.send(canonical({"type": "subscribe", "channel": "l2Orderbook",
-                                                "id": symbol, "nLevels": BOOK_LEVELS}))
-                strategy = asyncio.create_task(self.run_strategy())
-                done, _ = await asyncio.wait((receiver, strategy), return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    task.result()
-            finally:
-                if strategy:
-                    strategy.cancel()
-                    with suppress(asyncio.CancelledError, Exception):
-                        await strategy
-                for market in self.markets.values():
-                    for quote in list(market.quotes.values()):
-                        if quote.terminal.is_set():
-                            continue
-                        try:
-                            if receiver.done():
-                                raise ConnectionError("Flux arrêté")
-                            await self.cancel(market, quote)
-                        except Exception as exc:
-                            log.error("Annulation non confirmée : %s ; switch serveur laissé armé", exc)
-                receiver.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await receiver
+        next_scan = 0
+        try:
+            await asyncio.gather(self.arcus.markets(), self.lighter.markets())
+            # Reconcile journal-owned uncertain orders before rejecting external orders.
+            await self.monitor()
+            await asyncio.gather(self.arcus.check_orders(), self.lighter.check_orders())
+            while not self.stop.is_set():
+                await self.monitor()
+                if time.monotonic() >= next_scan:
+                    await self.scan()
+                    next_scan = time.monotonic() + SCAN_SECONDS
+                try:
+                    await asyncio.wait_for(self.stop.wait(), MONITOR_SECONDS)
+                except TimeoutError:
+                    pass
+        finally:
+            for symbol in list(self.state["active"]):
+                try:
+                    await self.close_pair(symbol, "arrêt du bot")
+                except Exception:
+                    log.exception("URGENT : vérifier manuellement les deux jambes de %s", symbol)
 
 
 async def main():
-    address = os.getenv("ARCUS_ADDRESS", "")
-    signing_key = os.getenv("ARCUS_SIGNING_KEY", "").removeprefix("0x")
-    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address) or not re.fullmatch(r"[0-9a-fA-F]{64}", signing_key):
-        raise ValueError("Définir ARCUS_ADDRESS et ARCUS_SIGNING_KEY (clé Ed25519 privée de 32 octets en hex)")
-    if not 0 <= ACCOUNT_INDEX <= 9:
-        raise ValueError("ARCUS_ACCOUNT_INDEX doit être entre 0 et 9")
-    if not 1 <= BOOK_LEVELS <= 100 or not D("0") < MIN_SIDE_SHARE < D("0.5"):
-        raise ValueError("Paramètres de carnet invalides")
-    def fetch_markets():
-        with urllib.request.urlopen(BASE_URL + "/v1/markets", timeout=10) as response:
-            return json.load(response)["markets"]
-    available = {m["marketDisplayName"]: m for m in await asyncio.to_thread(fetch_markets)}
-    markets = {}
-    for symbol, config in PAIRS.items():
-        info = available[symbol]
-        if info["status"] != "ONLINE" or config["order_usd"] <= 0 or config["max_position_usd"] <= 0:
-            raise ValueError(f"Marché ou configuration invalide : {symbol}")
-        markets[symbol] = Market(info, config)
-    await Bot(address, Ed25519PrivateKey.from_private_bytes(bytes.fromhex(signing_key)), markets).run()
+    if POSITION_USD <= 0 or MAX_PAIRS < 1 or STABILITY_HOURS <= 0 or MIN_FUNDING_GAP <= 0 or MAX_SPREAD <= 0:
+        raise ValueError("Paramètres de stratégie invalides")
+    async with Http() as http:
+        lighter = Lighter(http)
+        farmer = Farmer(Arcus(http), lighter)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, farmer.stop.set)
+            except NotImplementedError:
+                signal.signal(sig, lambda *_: loop.call_soon_threadsafe(farmer.stop.set))
+        try:
+            await farmer.run()
+        finally:
+            await lighter.close()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())

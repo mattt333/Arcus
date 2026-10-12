@@ -1,4 +1,9 @@
 .venv/
+.venv-sdk/
 __pycache__/
 .env
 .tmp-docs/
+funding-state.json
+funding-state.tmp
+
+funding-state.orders.jsonl
