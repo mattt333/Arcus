@@ -11,7 +11,7 @@ import uuid
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
-from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_position, check_oracle, check_book_spread, MAX_SPREAD, OPEN_SLIPPAGE
+from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_position, check_book_spread, MAX_SPREAD, OPEN_SLIPPAGE
 
 D = Decimal
 POSITION_USD = D(os.getenv("POSITION_USD", "100"))
@@ -300,15 +300,13 @@ class Farmer:
         ar, lr = D(a["nextFundingRate"]), D(e["fundingRate"])
         if direction(ar, lr) != orientation or relative_gap(ar, lr) < MIN_FUNDING_GAP:
             raise ValueError("Funding change avant entree")
-        check_oracle(a["markPrice"], a.get("oraclePrice", 0), orientation)
-        check_oracle(e["markPrice"], e.get("oraclePrice", 0), -orientation)
         books = await asyncio.gather(self.arcus.book(symbol), self.lighter.book(e["name"]))
         quantity = min(quantity, entry_plan(a, e, books, orientation))
         if self.stop.is_set():
             return
         if (lr * D(e["markPrice"]) - ar * D(a["markPrice"])) * orientation <= 0:
             raise ValueError("Funding combine non positif avant entree")
-        reason = f"ecart de funding eligible : Arcus={ar}/h, Lighter={lr}/h ; mark/oracle et liquidite valides"
+        reason = f"ecart de funding eligible : Arcus={ar}/h, Lighter={lr}/h ; funding et liquidite valides"
         trade = {"arcus": symbol, "lighter": e["name"], "quantity": str(quantity),
                  "orientation": orientation, "phase": "opening", "opened_at": time.time(),
                  "entry_reason": reason, "orders": [], "market_info": {"arcus": a, "lighter": e}}
@@ -324,9 +322,6 @@ class Farmer:
                 raise RuntimeError("Marge Lighter insuffisante apres ouverture")
             if self.stop.is_set():
                 raise RuntimeError("Arret demande pendant ouverture")
-            # Le mark/oracle Arcus peut avoir change pendant le fill Lighter.
-            arcus_now = next(r for r in await self.arcus.markets() if r["marketDisplayName"] == symbol)
-            check_oracle(arcus_now["markPrice"], arcus_now.get("oraclePrice", 0), orientation)
             await self.place_order(self.arcus, trade["arcus"], orientation, quantity, reason, trade=trade)
             ap, lp = await self.positions()
             p, q = ap.get(trade["arcus"]), lp.get(trade["lighter"])

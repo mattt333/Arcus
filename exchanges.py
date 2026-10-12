@@ -23,15 +23,6 @@ class UncertainOrder(TimeoutError):
         self.market, self.client_id = market, client_id
         super().__init__(f"Ordre {market} {client_id} non confirmé ; aucun renvoi automatique")
 
-def check_oracle(mark, oracle, side):
-    mark, oracle = D(str(mark)), D(str(oracle))
-    if not mark.is_finite() or not oracle.is_finite() or min(mark, oracle) <= 0:
-        raise ValueError("Mark/oracle indisponible")
-    if (mark - oracle) * side >= 0:
-        raise ValueError("Mark/oracle défavorable : long exige mark < oracle, short exige mark > oracle")
-
-
-
 def check_book_spread(book):
     if not book["bids"] or not book["asks"]:
         raise ValueError("Carnet vide")
@@ -198,7 +189,6 @@ class Arcus:
             fresh = next((r for r in await self.markets() if r["marketDisplayName"] == name), None)
             if fresh is None or fresh["status"] != "ONLINE":
                 raise ValueError("Marche Arcus indisponible")
-            check_oracle(fresh["markPrice"], fresh.get("oraclePrice", 0), side)
         market = self.info[name]
         before = (await self.positions()).get(name)
         before_size = before["size"] if before else D(0)
@@ -446,11 +436,6 @@ class Lighter:
         raise UncertainOrder(name, client_id)
 
     async def order(self, name, side, quantity, reduce_only=False, client_id=None):
-        if not reduce_only:
-            stat = (await self.stats()).get(str(self.info[name]["market_id"]))
-            if stat is None:
-                raise ValueError("Prix Lighter indisponibles")
-            check_oracle(stat["mark_price"], stat["index_price"], side)
         market = self.info[name]
         before = (await self.positions()).get(name)
         before_size = before["size"] if before else D(0)

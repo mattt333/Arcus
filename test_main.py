@@ -39,15 +39,6 @@ def position(size, mark="100", entry="100", liquidation=None):
 
 
 class StrategyTests(unittest.TestCase):
-    def test_mark_oracle_gate(self):
-        main.check_oracle("99", "100", 1)
-        main.check_oracle("101", "100", -1)
-        for mark, oracle, side in (("101", "100", 1), ("99", "100", -1),
-                                   ("100", "100", 1), ("NaN", "100", 1),
-                                   ("100", "0", -1)):
-            with self.assertRaises(ValueError):
-                main.check_oracle(mark, oracle, side)
-
     def test_funding_signs_and_relative_gap(self):
         self.assertEqual(direction(D("-.01"), D(".01")), 1)
         self.assertEqual(direction(D(".01"), D("-.01")), -1)
@@ -557,13 +548,14 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.a.orders), 1)
         self.assertEqual(len(self.e.orders), 1)
 
-    async def test_fresh_oracle_rejects_before_any_order(self):
-        self.a.info["oraclePrice"] = "99"
-        with self.assertRaisesRegex(ValueError, "oracle"):
+    async def test_entry_accepts_unfavorable_or_equal_or_missing_oracle(self):
+        for oracle_a, oracle_l in (("99", "101"), ("100", "100"), (None, None)):
+            self.a.info["oraclePrice"] = oracle_a
+            self.e.info["oraclePrice"] = oracle_l
             await self.open()
-        self.assertFalse(self.a.orders)
-        self.assertFalse(self.e.orders)
-        self.assertFalse(self.farmer.state["active"])
+            self.assertEqual(self.farmer.state["active"]["NVDA-USD"]["phase"], "open")
+            with patch("main.asyncio.sleep", new=AsyncMock()):
+                await self.farmer.close_pair("NVDA-USD", "test")
 
     async def test_arcus_failure_unwinds_lighter(self):
         self.a.fail = True

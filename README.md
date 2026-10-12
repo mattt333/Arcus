@@ -94,9 +94,6 @@ enregistrées dans son journal.
   exchanges. Verifier la profondeur pour la quantite entiere et relire le
   carnet juste avant ouverture. Le slippage de profondeur conserve son
   seuil distinct de 0,05 % a l'entree.
-- Avant chaque entrée : **long si mark < oracle ; short si mark > oracle**
-  sur chaque jambe. Refuser l'entrée si les prix sont égaux, invalides ou
-  indisponibles. Ce contrôle ne garantit pas l'évolution future du funding.
 - Environ 100 $ de notionnel par jambe, indépendamment du levier. Utiliser la
   même quantité d'actif des deux côtés, arrondie au pas commun. Ignorer la
   paire si les minimums ne permettent pas cette taille.
@@ -113,7 +110,7 @@ de 0,05 %.
 Les ordres sont envoyés en deux étapes : Lighter MARKET/IOC d'abord,
 puis Arcus LIMIT/FOK après confirmation du fill Lighter complet. Les deux
 jambes ne sont donc pas atomiques : le bot est temporairement exposé entre
-les fills. Le mark/oracle est relu avant chaque placement d'entrée.
+les fills. L'entree ne depend pas de la comparaison entre mark et oracle.
 Un ACK ne suffit pas : le statut terminal et la position sont confirmés.
 Si Lighter est indisponible et que le hedge est impossible, annuler tout
 ordre d'entrée encore actif. Si une jambe a déjà été exécutée, la refermer en
@@ -207,7 +204,7 @@ python -m unittest -v
 ```
 
 Les tests couvrent les fills partiels, les pannes de plateforme, les annulations,
-les placements incertains après redémarrage, les refus mark/oracle, la précision
+les placements incertains après redémarrage, les entrees independantes du mark/oracle, la précision
 des ordres, la conversion du funding et les bilans de PnL. Une signature
 Lighter MARKET/IOC sur Robinhood Chain est construite hors ligne avec une clé
 fictive. Les marches communs, les carnets publics et le flux de funding ont
