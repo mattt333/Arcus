@@ -20,6 +20,7 @@ HISTORY_SECONDS = 4 * 3600  # Stabilite minimale avant ouverture.
 MAX_PRICE_MOVE = D("0.10")
 LIQUIDATION_BUFFER = D("0.10")  # 10 % du trajet entrée -> liquidation restant.
 SCAN_SECONDS = 30
+FUNDING_EXIT_WINDOW_SECONDS = 120  # Controle de sortie uniquement de hh:58 a hh:59:59.
 MONITOR_SECONDS = 2
 STATE_FILE = Path(os.getenv("STATE_FILE", "funding-state.json"))
 log = logging.getLogger("funding")
@@ -432,12 +433,12 @@ class Farmer:
             update_history(samples, now, ar, er)
             trade = self.state["active"].get(symbol)
             if trade:
-                # À quantité égale, les paiements portent sur les notionnels
-                # propres à chaque plateforme, qui peuvent diverger en cours de vie.
-                gain_per_unit = (er * D(e["markPrice"])
-                                 - ar * D(a["markPrice"])) * trade["orientation"]
-                if gain_per_unit <= 0:
-                    await self.close_pair(symbol, "funding combiné nul ou inversé")
+                if time.time() % 3600 >= 3600 - FUNDING_EXIT_WINDOW_SECONDS:
+                    # Les paiements portent sur le notionnel propre a chaque jambe.
+                    gain_per_unit = (er * D(e["markPrice"])
+                                     - ar * D(a["markPrice"])) * trade["orientation"]
+                    if gain_per_unit <= 0:
+                        await self.close_pair(symbol, "funding combine nul ou inverse en fin d'heure")
                 continue
             if samples:
                 orientation = direction(ar, er)

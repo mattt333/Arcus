@@ -244,13 +244,49 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch("main.asyncio.sleep", new=AsyncMock()): await self.farmer.monitor()
         self.assertFalse(self.a.rows)
 
-    async def test_funding_inversion_closes_pair(self):
+    async def test_funding_inversion_closes_pair_at_58_minutes(self):
         await self.open()
         self.e.info["fundingRate"] = "0"
-        with patch("main.asyncio.sleep", new=AsyncMock()): await self.farmer.scan()
+        with patch("main.time.time", return_value=21480):
+            await self.farmer.scan()
         self.assertFalse(self.farmer.state["active"])
         self.assertFalse(self.a.rows)
         self.assertFalse(self.e.rows)
+
+    async def test_funding_inversion_waits_and_recovery_keeps_position(self):
+        await self.open()
+        self.e.info["fundingRate"] = "0"
+        for now in (18120, 21479.999):
+            with patch("main.time.time", return_value=now):
+                await self.farmer.scan()
+            self.assertIn("NVDA-USD", self.farmer.state["active"])
+            self.assertEqual(len(self.a.orders), 1)
+            self.assertEqual(len(self.e.orders), 1)
+        self.e.info["fundingRate"] = ".00002"
+        with patch("main.time.time", return_value=21480):
+            await self.farmer.scan()
+        self.assertIn("NVDA-USD", self.farmer.state["active"])
+        self.assertEqual(len(self.a.orders), 1)
+
+    async def test_funding_exit_window_ends_at_next_hour(self):
+        await self.open()
+        self.e.info["fundingRate"] = "0"
+        with patch("main.time.time", return_value=21600):
+            await self.farmer.scan()
+        self.assertIn("NVDA-USD", self.farmer.state["active"])
+        with patch("main.time.time", return_value=25199.999):
+            await self.farmer.scan()
+        self.assertFalse(self.farmer.state["active"])
+
+    async def test_zero_combined_funding_closes_only_in_exit_window(self):
+        await self.open()
+        self.e.info["fundingRate"] = self.a.info["nextFundingRate"]
+        with patch("main.time.time", return_value=18120):
+            await self.farmer.scan()
+        self.assertIn("NVDA-USD", self.farmer.state["active"])
+        with patch("main.time.time", return_value=21480):
+            await self.farmer.scan()
+        self.assertFalse(self.farmer.state["active"])
 
     async def test_max_pairs_prevents_new_entries(self):
         await self.open()
@@ -598,10 +634,10 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
         with patch("main.time.time", return_value=18000):
             await self.farmer.scan()
         self.e.info["fundingRate"] = "0"
-        with patch("main.time.time", return_value=18030):
+        with patch("main.time.time", return_value=21480):
             await self.farmer.scan()
         self.e.info["fundingRate"] = ".00002"
-        with patch("main.time.time", return_value=18060):
+        with patch("main.time.time", return_value=21510):
             self.farmer = Farmer(self.a, self.e, self.farmer.path)
             await self.farmer.scan()
         self.assertFalse(self.farmer.state["active"])

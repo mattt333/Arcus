@@ -138,7 +138,10 @@ jusqu'à confirmation de leur statut terminal.
 Fermer les deux jambes en taker, avec `reduceOnly`, si :
 
 - le funding horaire combiné dans le sens détenu devient nul ou négatif,
-  en tenant compte du mark price propre à chaque jambe ;
+  en tenant compte du mark price propre à chaque jambe, uniquement pendant
+  les deux dernieres minutes de l'heure (`hh:58:00` a `hh:59:59`). Une
+  inversion a `10:02` ne provoque aucune cloture pour funding avant `10:58`.
+  Si le funding est redevenu positif au controle, la position est conservee ;
 - le prix d'une jambe s'écarte de ±10 % de son entrée ;
 - il reste au plus 10 % de la distance entrée → liquidation à parcourir
   sur une jambe : entrée 100, liquidation 95 → sortie dès 95,50 ;
@@ -146,6 +149,8 @@ Fermer les deux jambes en taker, avec `reduceOnly`, si :
   de risque deviennent indisponibles.
 
 Risques vérifiés environ toutes les 2 secondes ; fundings toutes les 30 secondes.
+La sortie pour funding est controlee a chaque scan dans la fenetre de fin
+d'heure, soit un premier controle normalement entre `hh:58:00` et `hh:58:30`.
 Les appels réseau peuvent rallonger ces délais. Arcus n'expose pas de prix de
 liquidation : il est estimé en marge isolée à partir de
 `marginUsed + borrowedCapital`, de la quantité signée et de
