@@ -75,6 +75,17 @@ class StrategyTests(unittest.TestCase):
         volatile = [[0, "0", ".001"], [14400, "0", ".039"]]
         self.assertGreater(funding_score(stable, 14400), funding_score(volatile, 14400))
 
+    def test_four_hour_history_threshold_alignment_and_invalid_data(self):
+        a = [(D(t), D(".000007")) for t in range(0, 14401, 3600)]
+        b = [(D(t), D(".00001")) for t in range(0, 14401, 3600)]
+        self.assertTrue(main.stable_funding_history(a[::-1], b, 14430, 1))
+        self.assertFalse(main.stable_funding_history(a, b, 14430, -1))
+        self.assertFalse(main.stable_funding_history(a, b, 18000, 1))
+        for bad in (".00000701", "NaN", "Infinity"):
+            invalid = [(t, D(bad) if t == 7200 else r) for t, r in a]
+            self.assertFalse(main.stable_funding_history(invalid, b, 14430, 1))
+        self.assertFalse(main.stable_funding_history(a + [(D(7200), D(".000008"))], b, 14430, 1))
+
     def test_common_lot_and_equal_quantities(self):
         self.assertEqual(common_step(D(".006"), D(".004")), D(".012"))
         a, e = market_info()
@@ -141,6 +152,9 @@ class FakeExchange:
     async def markets(self): return [deepcopy(self.info)]
     async def book(self, name): return book()
     async def check_orders(self): pass
+    async def funding_history(self, name, start, end):
+        rate = D(self.info["nextFundingRate" if self.name == "Arcus" else "fundingRate"])
+        return [(D(hour), rate) for hour in range(int(start), int(end // 3600) * 3600 + 1, 3600)]
     async def cancel_order(self, name, client_id):
         return await self.order_status(name, client_id)
     async def order_status(self, name, client_id):
@@ -541,12 +555,44 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
     tearDown = LifecycleTests.tearDown
     open = LifecycleTests.open
 
-    async def test_scan_can_open_on_first_observation(self):
+    async def test_scan_can_open_with_confirmed_api_history(self):
         with patch("main.time.time", return_value=100):
             await self.farmer.scan()
         self.assertEqual(self.farmer.state["active"]["NVDA-USD"]["phase"], "open")
         self.assertEqual(len(self.a.orders), 1)
         self.assertEqual(len(self.e.orders), 1)
+
+    async def test_missing_or_unstable_history_blocks_orders(self):
+        now = 18000
+        good = [(D(t), D(".00002")) for t in range(3600, 18001, 3600)]
+        for rows in (good[:-1], good[1:], [],
+                     [(t, D(".000011") if t == 7200 else r) for t, r in good],
+                     [(t, D(".000005") if t == 7200 else r) for t, r in good]):
+            self.e.funding_history = AsyncMock(return_value=rows)
+            with patch("main.time.time", return_value=now):
+                await self.farmer.scan()
+            self.assertFalse(self.farmer.state["active"])
+            self.assertFalse(self.a.orders)
+            self.assertFalse(self.e.orders)
+
+    async def test_api_failure_blocks_entry_without_stopping_scan(self):
+        self.e.funding_history = AsyncMock(side_effect=RuntimeError("offline"))
+        await self.farmer.scan()
+        self.assertFalse(self.a.orders)
+        self.assertFalse(self.e.orders)
+
+    async def test_observed_inversion_blocks_reentry_for_four_hours(self):
+        with patch("main.time.time", return_value=18000):
+            await self.farmer.scan()
+        self.e.info["fundingRate"] = "0"
+        with patch("main.time.time", return_value=18030):
+            await self.farmer.scan()
+        self.e.info["fundingRate"] = ".00002"
+        with patch("main.time.time", return_value=18060):
+            self.farmer = Farmer(self.a, self.e, self.farmer.path)
+            await self.farmer.scan()
+        self.assertFalse(self.farmer.state["active"])
+        self.assertEqual(len(self.a.orders), 2)
 
     async def test_entry_accepts_unfavorable_or_equal_or_missing_oracle(self):
         for oracle_a, oracle_l in (("99", "101"), ("100", "100"), (None, None)):
@@ -594,6 +640,22 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ArcusAccountingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_funding_histories_units_and_signs(self):
+        arcus = Arcus.__new__(Arcus)
+        arcus.get = AsyncMock(return_value={"fundingRates": [
+            {"time": 3600000000, "fundingRate": "-.00001"}]})
+        self.assertEqual(await arcus.funding_history("NVDA-USD", 0, 7200),
+                         [(D(3600), D("-.00001"))])
+        self.assertEqual(arcus.get.call_args.kwargs["to"], 7200000000)
+        lighter = Lighter.__new__(Lighter)
+        lighter.info = {"NVDA-USD": {"market_id": 14}}
+        lighter.get = AsyncMock(return_value={"fundings": [
+            {"timestamp": 3600, "rate": ".001", "direction": "short"},
+            {"timestamp": 7200, "rate": ".002", "direction": "long"}]})
+        self.assertEqual(await lighter.funding_history("NVDA-USD", 0, 7200),
+                         [(D(3600), D("-.00001")), (D(7200), D(".00002"))])
+        self.assertEqual(lighter.get.call_args.kwargs["resolution"], "1h")
+
     async def test_closed_pnl_fees_are_not_deducted_twice(self):
         adapter = Arcus.__new__(Arcus)
         adapter.address, adapter.account = "0x" + "1" * 40, 0

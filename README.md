@@ -82,10 +82,19 @@ enregistrées dans son journal.
   Shorter le taux le plus élevé et longer le plus faible, même si les deux
   sont négatifs.
 - Ecart relatif : `abs(Lighter - Arcus) / max(abs(Lighter), abs(Arcus))`.
-  Il doit etre >=20 %. L'entree est eligible des la premiere observation,
-  sans attendre 4 heures. Mesure toutes les 30 secondes. L'historique de
-  classement conserve jusqu'a 4 heures de donnees ; il ne bloque pas l'entree.
-  Une inversion ou une interruption >90 secondes reinitialise cet historique.
+  Il doit etre >=30 %, dans le meme sens pendant les quatre dernieres heures.
+  Avant chaque ouverture, les historiques publics horaires sont recuperes via
+  `fundingRates` (Arcus) et `fundings` (Lighter). Les heures sont alignees et
+  le point precedent le debut de la fenetre est inclus : cinq taux horaires
+  sont verifies. Toute heure manquante, donnee invalide, inversion ou passage
+  sous le seuil bloque l'entree. Une API indisponible bloque cette entree.
+  Les taux regles horaires ne prouvent pas la stabilite des taux indicatifs
+  entre deux heures. Le bot complete ce controle par ses observations toutes
+  les 30 secondes ; une inversion ou un ecart insuffisant observe bloque
+  les nouvelles entrees pendant quatre heures, y compris apres redemarrage.
+  L'historique de classement conserve quatre heures ; une interruption
+  >90 secondes le reinitialise. L'API permet l'entree des le demarrage si
+  l'historique est conforme et qu'aucune observation locale ne l'invalide.
 - Classement : écart horaire moyen divisé par `1 + écart-type / moyenne`.
   Le score privilégie les écarts élevés et réguliers observés ; il ne prédit
   pas les fundings futurs ni le rendement net de frais.
@@ -188,7 +197,7 @@ et ce journal.
 |---|---|---|
 | `POSITION_USD` | `100` | Notionnel maximal par jambe |
 | `MAX_PAIRS` | `2` | Nombre maximal de paires ouvertes |
-| `MIN_FUNDING_GAP` | `0.20` | Écart relatif de funding |
+| `MIN_FUNDING_GAP` | `0.30` | Écart relatif de funding |
 | `MAX_SPREAD` | `0.0003` | Spread bid/ask uniquement ; plafond 0,03 %, configurable plus bas |
 | `STATE_FILE` | `funding-state.json` | Fichier d'état |
 | `ARCUS_BASE_URL` | `https://api.arcus.xyz` | API Arcus mainnet uniquement |
@@ -196,6 +205,9 @@ et ce journal.
 | `LIGHTER_ACCOUNT_INDEX` | requis | Index du compte Lighter |
 | `LIGHTER_API_KEY_INDEX` | requis | Index de la clé API Lighter |
 | `LIGHTER_API_PRIVATE_KEY` | requis | Clé privée API Lighter |
+
+Si `MIN_FUNDING_GAP` est deja defini dans l'environnement de lancement,
+le passer a `0.30` : cette variable remplace le defaut du code.
 
 ## Vérifications
 

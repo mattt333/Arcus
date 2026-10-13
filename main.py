@@ -16,8 +16,8 @@ from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_posit
 D = Decimal
 POSITION_USD = D(os.getenv("POSITION_USD", "100"))
 MAX_PAIRS = int(os.getenv("MAX_PAIRS", "2"))
-MIN_FUNDING_GAP = D(os.getenv("MIN_FUNDING_GAP", "0.20"))
-HISTORY_SECONDS = 4 * 3600  # Fen?tre de classement, sans attente avant entr?e.
+MIN_FUNDING_GAP = D(os.getenv("MIN_FUNDING_GAP", "0.30"))
+HISTORY_SECONDS = 4 * 3600  # Stabilite minimale avant ouverture.
 MAX_PRICE_MOVE = D("0.10")
 LIQUIDATION_BUFFER = D("0.10")  # 10 % du trajet entrée -> liquidation restant.
 SCAN_SECONDS = 30
@@ -78,6 +78,26 @@ def funding_score(samples, now):
     mean = statistics.fmean(gains)
     deviation = statistics.pstdev(gains)
     return mean / (1 + deviation / mean) if mean else None
+
+
+def stable_funding_history(arcus, lighter, now, orientation):
+    """Comparer les memes heures, avec un point couvrant le debut de la fenetre."""
+    end = int(now // 3600) * 3600
+    start = int((now - HISTORY_SECONDS) // 3600) * 3600
+    rates = []
+    for rows in (arcus, lighter):
+        by_time = {}
+        for timestamp, rate in rows:
+            if timestamp in by_time and by_time[timestamp] != rate:
+                return False
+            by_time[timestamp] = rate
+        rates.append(by_time)
+    for hour in range(start, end + 1, 3600):
+        a, b = rates[0].get(hour), rates[1].get(hour)
+        if (a is None or b is None or not a.is_finite() or not b.is_finite()
+                or a == b or direction(a, b) != orientation or relative_gap(a, b) < MIN_FUNDING_GAP):
+            return False
+    return True
 
 
 def vwap(levels, quantity):
@@ -290,6 +310,24 @@ class Farmer:
         self.save()
 
     async def open_pair(self, symbol, a, e, orientation, quantity):
+        now = time.time()
+        invalid_at = self.state.get("funding_invalid_at", {}).get(symbol)
+        if invalid_at is not None and now - invalid_at < HISTORY_SECONDS:
+            raise ValueError("Funding instable observe pendant les quatre dernieres heures")
+        for timestamp, ar, lr in self.state["history"].get(symbol, []):
+            if timestamp >= now - HISTORY_SECONDS:
+                ar, lr = D(ar), D(lr)
+                if (not ar.is_finite() or not lr.is_finite() or ar == lr
+                        or direction(ar, lr) != orientation or relative_gap(ar, lr) < MIN_FUNDING_GAP):
+                    raise ValueError("Historique observe incompatible avec le seuil de funding")
+        start = int((now - HISTORY_SECONDS) // 3600) * 3600
+        try:
+            ah, lh = await asyncio.gather(self.arcus.funding_history(symbol, start, now),
+                                          self.lighter.funding_history(e["name"], start, now))
+        except Exception as exc:
+            raise ValueError("Historique de funding indisponible ; entree bloquee") from exc
+        if not stable_funding_history(ah, lh, now, orientation):
+            raise ValueError("Ecart de funding non confirme sur les quatre dernieres heures")
         await asyncio.gather(self.arcus.set_leverage(a), self.lighter.set_leverage(e))
         # Relecture des taux ET des prix avant l'envoi, pas seulement des carnets.
         am, lm = await asyncio.gather(self.arcus.markets(), self.lighter.markets())
@@ -371,6 +409,9 @@ class Farmer:
             if not ar.is_finite() or not er.is_finite():
                 raise ValueError("Funding non fini")
             samples = self.state["history"].setdefault(symbol, [])
+            if (ar == er or relative_gap(ar, er) < MIN_FUNDING_GAP
+                    or samples and direction(D(samples[-1][1]), D(samples[-1][2])) != direction(ar, er)):
+                self.state.setdefault("funding_invalid_at", {})[symbol] = now
             update_history(samples, now, ar, er)
             trade = self.state["active"].get(symbol)
             if trade:
@@ -391,7 +432,7 @@ class Farmer:
             if symbol not in self.pairs:
                 await self.close_pair(symbol, "marché ou funding devenu indisponible")
         self.save()
-        log.info("%s RWA communs ; %s paires ouvertes ; %s eligibles sans delai d'observation",
+        log.info("%s RWA communs ; %s paires ouvertes ; %s candidats avant controle historique de 4 h",
                  len(self.pairs), len(self.state["active"]), len(ranked))
         for score, symbol, orientation, a, e in sorted(ranked, reverse=True, key=lambda x: x[0]):
             if len(self.state["active"]) >= MAX_PAIRS or self.stop.is_set():

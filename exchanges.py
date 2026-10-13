@@ -1,6 +1,7 @@
 """REST Arcus et Lighter. Aucun renvoi automatique d'un placement incertain."""
 import asyncio
 import json
+import math
 import os
 import time
 import uuid
@@ -111,6 +112,14 @@ class Arcus:
     async def book(self, name):
         row = await self.get(f"l2OrderBook/{name}", nLevels=100)
         return {side: [(D(p), D(q)) for p, q in row[side]] for side in ("bids", "asks")}
+
+    async def funding_history(self, name, start, end):
+        data = await self.get("fundingRates", market=name, limit=1000,
+                              **{"from": int(start * 1_000_000), "to": int(end * 1_000_000)})
+        rows = data["fundingRates"]
+        if len(rows) >= 1000:
+            raise ValueError("Historique de funding Arcus tronque")
+        return [(D(str(row["time"])) / 1_000_000, D(row["fundingRate"])) for row in rows]
 
     async def set_leverage(self, market):
         leverage = int(D(1) / D(market["initialMarginFraction"]))
@@ -325,6 +334,18 @@ class Lighter:
         row = await self.get("orderBookOrders", market_id=self.info[name]["market_id"], limit=250)
         return {side: sorted([(D(r["price"]), D(r["remaining_base_amount"])) for r in row[side]],
                              reverse=side == "bids") for side in ("bids", "asks")}
+
+    async def funding_history(self, name, start, end):
+        data = await self.get("fundings", market_id=self.info[name]["market_id"], resolution="1h",
+                              start_timestamp=int(start), end_timestamp=int(end),
+                              count_back=math.ceil((end - start) / 3600) + 2)
+        result = []
+        for row in data["fundings"]:
+            if row["direction"] not in ("long", "short"):
+                raise ValueError("Sens du funding Lighter inconnu")
+            rate = abs(D(row["rate"])) / 100
+            result.append((D(str(row["timestamp"])), rate if row["direction"] == "long" else -rate))
+        return result
 
     async def account_rows(self):
         result, cursor = [], None
