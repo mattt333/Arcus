@@ -95,9 +95,15 @@ enregistrées dans son journal.
   L'historique de classement conserve quatre heures ; une interruption
   >90 secondes le reinitialise. L'API permet l'entree des le demarrage si
   l'historique est conforme et qu'aucune observation locale ne l'invalide.
-- Classement : écart horaire moyen divisé par `1 + écart-type / moyenne`.
-  Le score privilégie les écarts élevés et réguliers observés ; il ne prédit
-  pas les fundings futurs ni le rendement net de frais.
+- Classement : toutes les paires communes admissibles sont comparees avant
+  toute ouverture, a partir des historiques API des deux plateformes.
+  Le score est la moyenne de `abs(Lighter - Arcus)` sur exactement quatre
+  heures, ponderee par la duree couverte par chaque taux horaire, sans penalite
+  de volatilite. Il compare l'ecart absolu des taux, pas l'ecart relatif de 30 %.
+  Ouvrir les meilleures paires dans l'ordre decroissant, selon les places
+  disponibles et la liquidite. L'historique est revalide avant chaque ouverture.
+  Les positions existantes sont conservees jusqu'a un critere de sortie.
+  Le score ne predit pas les fundings futurs ni le rendement net de frais.
 - Spread bid/ask <=0,03 % sur chacun des deux exchanges, mesure par
   `(ask - bid) / ((ask + bid) / 2)`. Aucun filtre sur l'ecart de prix entre
   exchanges. Verifier la profondeur pour la quantite entiere et relire le

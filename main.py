@@ -5,7 +5,6 @@ import logging
 import math
 import os
 import signal
-import statistics
 import time
 import uuid
 from decimal import Decimal, ROUND_DOWN
@@ -72,12 +71,11 @@ def update_history(samples, now, a, b):
 
 
 def funding_score(samples, now):
-    if not samples:
+    gains = [abs(D(b) - D(a)) for timestamp, a, b in samples
+             if now - HISTORY_SECONDS <= timestamp <= now]
+    if not gains:
         return None
-    gains = [float(abs(D(b) - D(a))) for _, a, b in samples]
-    mean = statistics.fmean(gains)
-    deviation = statistics.pstdev(gains)
-    return mean / (1 + deviation / mean) if mean else None
+    return sum(gains, D(0)) / len(gains)
 
 
 def stable_funding_history(arcus, lighter, now, orientation):
@@ -98,6 +96,20 @@ def stable_funding_history(arcus, lighter, now, orientation):
                 or a == b or direction(a, b) != orientation or relative_gap(a, b) < MIN_FUNDING_GAP):
             return False
     return True
+
+
+def funding_history_score(arcus, lighter, now, orientation):
+    """Ecart absolu moyen sur exactement 4 h, pondere par la duree de chaque taux horaire."""
+    if not stable_funding_history(arcus, lighter, now, orientation):
+        return None
+    a, b = dict(arcus), dict(lighter)
+    end = D(str(now))
+    start = end - HISTORY_SECONDS
+    total = D(0)
+    for hour in range(int(start // 3600) * 3600, int(end // 3600) * 3600 + 1, 3600):
+        duration = min(end, D(hour + 3600)) - max(start, D(hour))
+        total += abs(b[hour] - a[hour]) * duration
+    return total / HISTORY_SECONDS
 
 
 def vwap(levels, quantity):
@@ -309,8 +321,7 @@ class Farmer:
         self.state["history"].pop(symbol, None)
         self.save()
 
-    async def open_pair(self, symbol, a, e, orientation, quantity):
-        now = time.time()
+    async def candidate_score(self, symbol, e, orientation, now):
         invalid_at = self.state.get("funding_invalid_at", {}).get(symbol)
         if invalid_at is not None and now - invalid_at < HISTORY_SECONDS:
             raise ValueError("Funding instable observe pendant les quatre dernieres heures")
@@ -326,8 +337,13 @@ class Farmer:
                                           self.lighter.funding_history(e["name"], start, now))
         except Exception as exc:
             raise ValueError("Historique de funding indisponible ; entree bloquee") from exc
-        if not stable_funding_history(ah, lh, now, orientation):
+        score = funding_history_score(ah, lh, now, orientation)
+        if score is None:
             raise ValueError("Ecart de funding non confirme sur les quatre dernieres heures")
+        return score
+
+    async def open_pair(self, symbol, a, e, orientation, quantity):
+        score = await self.candidate_score(symbol, e, orientation, time.time())
         await asyncio.gather(self.arcus.set_leverage(a), self.lighter.set_leverage(e))
         # Relecture des taux ET des prix avant l'envoi, pas seulement des carnets.
         am, lm = await asyncio.gather(self.arcus.markets(), self.lighter.markets())
@@ -344,7 +360,8 @@ class Farmer:
             return
         if (lr * D(e["markPrice"]) - ar * D(a["markPrice"])) * orientation <= 0:
             raise ValueError("Funding combine non positif avant entree")
-        reason = f"ecart de funding eligible : Arcus={ar}/h, Lighter={lr}/h ; funding et liquidite valides"
+        reason = (f"ecart de funding eligible : Arcus={ar}/h, Lighter={lr}/h ; "
+                  f"ecart moyen 4 h={score}/h ; funding et liquidite valides")
         trade = {"arcus": symbol, "lighter": e["name"], "quantity": str(quantity),
                  "orientation": orientation, "phase": "opening", "opened_at": time.time(),
                  "entry_reason": reason, "orders": [], "market_info": {"arcus": a, "lighter": e}}
@@ -422,9 +439,14 @@ class Farmer:
                 if gain_per_unit <= 0:
                     await self.close_pair(symbol, "funding combiné nul ou inversé")
                 continue
-            score = funding_score(samples, now)
-            if score is not None:
-                ranked.append((score, symbol, direction(ar, er), a, e))
+            if samples:
+                orientation = direction(ar, er)
+                try:
+                    score = await self.candidate_score(symbol, e, orientation, now)
+                except ValueError as exc:
+                    log.info("Ignore %s : %s", symbol, exc)
+                    continue
+                ranked.append((score, symbol, orientation, a, e))
         for symbol in list(self.state["history"]):
             if symbol not in self.pairs:
                 del self.state["history"][symbol]
@@ -432,7 +454,7 @@ class Farmer:
             if symbol not in self.pairs:
                 await self.close_pair(symbol, "marché ou funding devenu indisponible")
         self.save()
-        log.info("%s RWA communs ; %s paires ouvertes ; %s candidats avant controle historique de 4 h",
+        log.info("%s RWA communs ; %s paires ouvertes ; %s candidats avec historique de 4 h valide",
                  len(self.pairs), len(self.state["active"]), len(ranked))
         for score, symbol, orientation, a, e in sorted(ranked, reverse=True, key=lambda x: x[0]):
             if len(self.state["active"]) >= MAX_PAIRS or self.stop.is_set():
@@ -443,7 +465,7 @@ class Farmer:
             except ValueError as exc:
                 log.info("Ignoré %s : %s", symbol, exc)
                 continue
-            log.info("Candidat %s : score horaire %.6g", symbol, score)
+            log.info("Candidat %s : ecart absolu moyen sur 4 h %.6g/h", symbol, score)
             try:
                 await self.open_pair(symbol, a, e, orientation, quantity)
             except ValueError as exc:

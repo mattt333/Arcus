@@ -70,10 +70,17 @@ class StrategyTests(unittest.TestCase):
             update_history(samples, now, D(a), D(b))
             self.assertLessEqual(len(samples), 1)
 
-    def test_stable_gap_scores_better(self):
+    def test_ranking_uses_mean_without_volatility_penalty(self):
         stable = [[0, "0", ".02"], [14400, "0", ".02"]]
         volatile = [[0, "0", ".001"], [14400, "0", ".039"]]
-        self.assertGreater(funding_score(stable, 14400), funding_score(volatile, 14400))
+        self.assertEqual(funding_score(stable, 14400), funding_score(volatile, 14400))
+
+    def test_api_mean_covers_exactly_four_hours(self):
+        a = [(D(t), D(0)) for t in range(0, 14401, 3600)]
+        b = [(D(t), D(".04") if t == 0 else D(".02")) for t, _ in a]
+        self.assertEqual(main.funding_history_score(a, b, 14400, 1), D(".025"))
+        self.assertEqual(main.funding_history_score(a, b, 16200, 1), D(".0225"))
+        self.assertIsNone(main.funding_history_score(a, b[:-1], 16200, 1))
 
     def test_four_hour_history_threshold_alignment_and_invalid_data(self):
         a = [(D(t), D(".000007")) for t in range(0, 14401, 3600)]
@@ -294,19 +301,25 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.e.rows)
         self.assertFalse(self.farmer.state["active"])
 
-    async def test_best_stable_gap_selected_with_one_slot(self):
+    async def test_best_api_mean_selected_despite_lower_current_gap(self):
         a2, e2 = deepcopy(self.a_info), deepcopy(self.e_info)
         a2["marketDisplayName"], a2["marketId"] = "AMD-USD", 29
         e2["name"], e2["symbol"] = "AMD-USD", "AMD"
-        e2["fundingRate"] = "0.00005"
+        e2["fundingRate"] = "0.000015"
         self.a.markets = AsyncMock(return_value=[self.a_info, a2])
         self.e.markets = AsyncMock(return_value=[self.e_info, e2])
+        async def history(name, start, end):
+            rate = D(".00005" if name == "AMD-USD" else ".00002")
+            return [(D(t), rate) for t in range(int(start), int(end) + 1, 3600)]
+        self.e.funding_history = AsyncMock(side_effect=history)
         self.farmer.state["history"] = {
             "NVDA-USD": [[0, ".00001", ".00002"], [14370, ".00001", ".00002"]],
             "AMD-USD": [[0, ".00001", ".00005"], [14370, ".00001", ".00005"]]}
         with patch("main.MAX_PAIRS", 1), patch("main.time.time", return_value=14400):
             await self.farmer.scan()
         self.assertEqual(set(self.farmer.state["active"]), {"AMD-USD"})
+        self.assertEqual([call.args[0] for call in self.e.funding_history.call_args_list],
+                         ["NVDA-USD", "AMD-USD", "AMD-USD"])
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
