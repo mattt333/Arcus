@@ -10,7 +10,7 @@ import uuid
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
-from exchanges import Arcus, Lighter, Http, TERMINAL, UncertainOrder, wait_position, check_book_spread, MAX_SPREAD, OPEN_SLIPPAGE
+from exchanges import Arcus, Lighter, Http, ApiError, TERMINAL, UncertainOrder, wait_position, check_book_spread, MAX_SPREAD, OPEN_SLIPPAGE
 
 D = Decimal
 POSITION_USD = D(os.getenv("POSITION_USD", "100"))
@@ -22,8 +22,17 @@ LIQUIDATION_BUFFER = D("0.10")  # 10 % du trajet entrée -> liquidation restant.
 SCAN_SECONDS = 30
 FUNDING_EXIT_WINDOW_SECONDS = 120  # Controle de sortie uniquement de hh:58 a hh:59:59.
 MONITOR_SECONDS = 2
+API_ERROR_GRACE_SECONDS = 10
+REENTRY_COOLDOWN_SECONDS = 600
 STATE_FILE = Path(os.getenv("STATE_FILE", "funding-state.json"))
 log = logging.getLogger("funding")
+
+
+class PositionReadError(RuntimeError):
+    def __init__(self, results):
+        self.results = results
+        super().__init__("Lecture des positions indisponible : " + "; ".join(
+            str(r) for r in results if isinstance(r, BaseException)))
 
 
 def common_step(a, b):
@@ -177,6 +186,7 @@ class Farmer:
                     exchange.info[trade[venue]] = trade["market_info"][venue]
         self.pairs = {}
         self.stop = asyncio.Event()
+        self.position_error_since = None
 
     def save(self):
         temporary = self.path.with_suffix(".tmp")
@@ -235,7 +245,7 @@ class Farmer:
         results = await asyncio.gather(self.arcus.positions(), self.lighter.positions(), return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException):
-                raise result
+                raise PositionReadError(results)
         return results
 
     async def close_pair(self, symbol, reason):
@@ -319,10 +329,13 @@ class Farmer:
         self.audit("pair_closed", symbol=symbol, reason=reason, pnl=pnl, net_pnl=net, trade=trade)
         self.state.setdefault("closed", []).append({**trade, "symbol": symbol, "pnl": pnl, "net_pnl": str(net) if net is not None else None})
         del self.state["active"][symbol]
+        self.state.setdefault("cooldown_until", {})[symbol] = trade["closed_at"] + REENTRY_COOLDOWN_SECONDS
         self.state["history"].pop(symbol, None)
         self.save()
 
     async def candidate_score(self, symbol, e, orientation, now):
+        if now < self.state.get("cooldown_until", {}).get(symbol, 0):
+            raise ValueError("Temporisation de 10 minutes apres fermeture")
         invalid_at = self.state.get("funding_invalid_at", {}).get(symbol)
         if invalid_at is not None and now - invalid_at < HISTORY_SECONDS:
             raise ValueError("Funding instable observe pendant les quatre dernieres heures")
@@ -414,6 +427,41 @@ class Farmer:
             for symbol in ranked[:len(self.state["active"]) - MAX_PAIRS]:
                 await self.close_pair(symbol, "réduction du nombre maximal de paires")
 
+    async def guarded_monitor(self):
+        """Une lecture en panne n'est jamais interpretee comme une position nulle."""
+        try:
+            await self.monitor()
+        except PositionReadError as exc:
+            now = time.monotonic()
+            if self.position_error_since is None:
+                self.position_error_since = now
+            log.warning("%s ; entrees suspendues", exc)
+            if now - self.position_error_since >= API_ERROR_GRACE_SECONDS:
+                for symbol, trade in list(self.state["active"].items()):
+                    exposed = trade["phase"] != "open"
+                    for venue, rows, side in zip(("arcus", "lighter"), exc.results,
+                                                 (trade["orientation"], -trade["orientation"])):
+                        if isinstance(rows, BaseException):
+                            continue
+                        row = rows.get(trade[venue])
+                        actual = row["size"] if row else D(0)
+                        if actual != D(trade["quantity"]) * side:
+                            exposed = True
+                    if exposed:
+                        try:
+                            await self.close_pair(symbol, "incident API persistant et couverture compromise")
+                        except Exception:
+                            log.exception("Fermeture a retenter pour %s ; journal conserve", symbol)
+            return False
+        except Exception:
+            # Une fermeture incomplete reste en phase closing et sera retentee.
+            if not any(t["phase"] == "closing" for t in self.state["active"].values()):
+                raise
+            log.exception("Fermeture incomplete ; entrees suspendues et nouvelle tentative au prochain cycle")
+            return False
+        self.position_error_since = None
+        return True
+
     async def scan(self):
         am, em = await asyncio.gather(self.arcus.markets(), self.lighter.markets())
         self.pairs = match_markets(am, em)
@@ -477,19 +525,30 @@ class Farmer:
         try:
             await asyncio.gather(self.arcus.markets(), self.lighter.markets())
             # Reconcile journal-owned uncertain orders before rejecting external orders.
-            await self.monitor()
-            await asyncio.gather(self.arcus.check_orders(), self.lighter.check_orders())
+            orders_checked = False
             while not self.stop.is_set():
-                await self.monitor()
-                if time.monotonic() >= next_scan:
-                    await self.scan()
+                healthy = await self.guarded_monitor()
+                if healthy and not orders_checked:
+                    await asyncio.gather(self.arcus.check_orders(), self.lighter.check_orders())
+                    orders_checked = True
+                if healthy and time.monotonic() >= next_scan:
+                    try:
+                        await self.scan()
+                    except ApiError:
+                        log.exception("Scan indisponible ; nouvelles entrees suspendues")
+                    except Exception:
+                        if not any(t["phase"] == "closing" for t in self.state["active"].values()):
+                            raise
+                        log.exception("Fermeture a retenter au prochain cycle")
                     next_scan = time.monotonic() + SCAN_SECONDS
                 try:
                     await asyncio.wait_for(self.stop.wait(), MONITOR_SECONDS)
                 except TimeoutError:
                     pass
         finally:
-            for symbol in list(self.state["active"]):
+            # Seul un arret explicite ferme toutes les paires. Un crash conserve
+            # le journal pour reconciliation, sans liquider les paires saines.
+            for symbol in list(self.state["active"]) if self.stop.is_set() else []:
                 try:
                     await self.close_pair(symbol, "arrêt du bot")
                 except Exception:

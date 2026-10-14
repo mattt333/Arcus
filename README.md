@@ -196,11 +196,25 @@ confirmés, le bilan indique `unavailable` et des valeurs `null`, sans inventer
 un PnL nul. Cela n'empêche pas la fermeture des positions. Le bilan enregistré
 n'est pas recalculé automatiquement lorsque ces données redeviennent disponibles.
 
-`Ctrl+C`, SIGTERM ou une erreur déclenchent une tentative de fermeture des
+`Ctrl+C` ou SIGTERM déclenchent une tentative de fermeture des
 paires enregistrées. Si elle échoue, le journal reste conservé et un message
 URGENT demande une vérification manuelle. Un crash brutal ou un serveur éteint
 laisse les positions ouvertes. Ne lancer qu'une instance sur ces comptes
 et ce journal.
+
+Une erreur de lecture des positions suspend les nouvelles entrées sans fermer
+les paires saines. Les lectures sont retentées à chaque cycle. Après 10 secondes
+de panne, si une jambe lisible ne correspond plus à la quantité attendue, la
+paire est fermée en reduce-only ; une fermeture incomplète est retentée aux
+cycles suivants. Une plateforme illisible ne vaut jamais une position nulle :
+le delta réel ne peut pas être confirmé tant que les deux lectures ne sont pas
+disponibles. Un déséquilibre confirmé sur les deux plateformes déclenche la
+fermeture immédiatement. Une erreur fatale conserve le journal sans fermer
+automatiquement toutes les paires ; le redémarrage réconcilie les opérations.
+
+Après chaque fermeture, le même symbole ne peut pas être rouvert pendant
+10 minutes. Cette temporisation est conservée dans le journal, y compris
+après redémarrage.
 
 ## Paramètres de stratégie
 

@@ -200,6 +200,103 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await restarted.monitor()
         self.assertEqual(restarted.state["active"]["NVDA-USD"]["phase"], "open")
 
+    async def test_temporary_position_failure_preserves_pair_and_recovers(self):
+        await self.open()
+        count = len(self.a.orders) + len(self.e.orders)
+        with patch.object(self.e, "positions", side_effect=ValueError("invalid JSON")):
+            self.assertFalse(await self.farmer.guarded_monitor())
+        self.assertTrue(await self.farmer.guarded_monitor())
+        self.assertIsNone(self.farmer.position_error_since)
+        self.assertEqual(len(self.a.orders) + len(self.e.orders), count)
+        self.assertEqual(self.farmer.state["active"]["NVDA-USD"]["phase"], "open")
+
+    async def test_persistent_unreadable_leg_does_not_imply_zero_position(self):
+        await self.open()
+        with patch.object(self.e, "positions", side_effect=ValueError("invalid JSON")), \
+                patch("main.time.monotonic", return_value=100) as timer:
+            self.assertFalse(await self.farmer.guarded_monitor())
+            timer.return_value = 111
+            self.assertFalse(await self.farmer.guarded_monitor())
+        self.assertEqual(len(self.a.orders), 1)
+        self.assertEqual(self.farmer.state["active"]["NVDA-USD"]["phase"], "open")
+
+    async def test_persistent_error_with_changed_leg_retries_close_until_recovery(self):
+        await self.open()
+        self.a.rows.clear()
+        with patch.object(self.e, "positions", side_effect=ValueError("invalid JSON")), \
+                patch("main.time.monotonic", return_value=100) as timer, \
+                patch("main.asyncio.sleep", new=AsyncMock()):
+            await self.farmer.guarded_monitor()
+            timer.return_value = 109
+            await self.farmer.guarded_monitor()
+            self.assertEqual(self.farmer.state["active"]["NVDA-USD"]["phase"], "open")
+            timer.return_value = 111
+            await self.farmer.guarded_monitor()
+            self.assertEqual(self.farmer.state["active"]["NVDA-USD"]["phase"], "closing")
+            timer.return_value = 113
+            await self.farmer.guarded_monitor()
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            self.assertTrue(await self.farmer.guarded_monitor())
+        self.assertFalse(self.farmer.state["active"])
+        self.assertFalse(self.e.rows)
+
+    async def test_cooldown_survives_restart_and_expires_after_ten_minutes(self):
+        await self.open()
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            await self.farmer.close_pair("NVDA-USD", "test")
+        restarted = Farmer(self.a, self.e, self.farmer.path)
+        deadline = restarted.state["cooldown_until"]["NVDA-USD"]
+        with patch("main.time.time", return_value=deadline - 1):
+            with self.assertRaisesRegex(ValueError, "Temporisation"):
+                await restarted.open_pair("NVDA-USD", self.a_info, self.e_info, 1, D(".99"))
+            await restarted.scan()
+        self.assertEqual(len(self.a.orders), 2)
+        with patch("main.time.time", return_value=deadline):
+            await restarted.open_pair("NVDA-USD", self.a_info, self.e_info, 1, D(".99"))
+        self.assertEqual(restarted.state["active"]["NVDA-USD"]["phase"], "open")
+
+    async def test_unexpected_crash_does_not_liquidate_healthy_pairs(self):
+        await self.open()
+        with patch.object(self.a, "markets", side_effect=RuntimeError("startup failure")):
+            with self.assertRaisesRegex(RuntimeError, "startup failure"):
+                await self.farmer.run()
+        self.assertEqual(len(self.a.orders), 1)
+        self.assertEqual(len(self.e.orders), 1)
+
+    async def test_run_skips_entry_during_failure_then_resumes(self):
+        await self.open()
+        real_positions = self.e.positions
+        calls = 0
+
+        async def flaky_positions():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("invalid JSON")
+            return await real_positions()
+
+        async def scan_then_crash():
+            raise RuntimeError("end test")
+
+        with patch.object(self.e, "positions", side_effect=flaky_positions), \
+                patch.object(self.farmer, "scan", side_effect=scan_then_crash) as scan, \
+                patch("main.MONITOR_SECONDS", 0.001):
+            with self.assertRaisesRegex(RuntimeError, "end test"):
+                await self.farmer.run()
+        self.assertEqual(calls, 2)
+        scan.assert_awaited_once()
+        self.assertEqual(len(self.a.orders), 1)
+        self.assertEqual(len(self.e.orders), 1)
+
+    async def test_explicit_stop_still_closes_pairs(self):
+        await self.open()
+        self.farmer.stop.set()
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            await self.farmer.run()
+        self.assertFalse(self.farmer.state["active"])
+        self.assertFalse(self.a.rows)
+        self.assertFalse(self.e.rows)
+
     async def test_order_audit_records_reasons_and_unknown_costs(self):
         await self.open()
         with patch("main.asyncio.sleep", new=AsyncMock()):
@@ -645,6 +742,8 @@ class EntrySafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_entry_accepts_unfavorable_or_equal_or_missing_oracle(self):
         for oracle_a, oracle_l in (("99", "101"), ("100", "100"), (None, None)):
+            # Chaque variante teste uniquement l'oracle, hors temporisation.
+            self.farmer.state.pop("cooldown_until", None)
             self.a.info["oraclePrice"] = oracle_a
             self.e.info["oraclePrice"] = oracle_l
             await self.open()

@@ -19,6 +19,10 @@ CLOSE_SLIPPAGE = D("0.02")
 TERMINAL = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "MARGIN_CANCELED"}
 
 
+class ApiError(RuntimeError):
+    pass
+
+
 class UncertainOrder(TimeoutError):
     def __init__(self, market, client_id):
         self.market, self.client_id = market, client_id
@@ -69,11 +73,19 @@ class Http:
         await self.session.close()
 
     async def call(self, method, url, body=None, headers=None, params=None):
-        async with self.session.request(method, url, json=body, headers=headers, params=params) as response:
-            data = await response.json(content_type=None)
-            if response.status >= 400 or data.get("status") == "ERROR" or data.get("error") or data.get("code", 200) != 200:
-                raise RuntimeError(f"{method} {url}: HTTP {response.status}, code {data.get('code')}")
-            return data
+        try:
+            async with self.session.request(method, url, json=body, headers=headers, params=params) as response:
+                try:
+                    data = await response.json(content_type=None)
+                except (ValueError, UnicodeError) as exc:
+                    raise ApiError(f"{method} {url}: HTTP {response.status}, reponse JSON invalide") from exc
+                if not isinstance(data, dict):
+                    raise ApiError(f"{method} {url}: HTTP {response.status}, format inattendu")
+                if response.status >= 400 or data.get("status") == "ERROR" or data.get("error") or data.get("code", 200) != 200:
+                    raise ApiError(f"{method} {url}: HTTP {response.status}, code {data.get('code')}")
+                return data
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise ApiError(f"{method} {url}: {type(exc).__name__}") from exc
 
 
 class Arcus:
