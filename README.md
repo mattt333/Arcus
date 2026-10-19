@@ -2,7 +2,8 @@
 
 Bot d'arbitrage de funding entre Arcus et
 [Lighter sur Robinhood Chain](https://robinhoodchain.lighter.xyz/), sur les
-contrats d'actions et de matières premières communs aux deux plateformes.
+marchés perpétuels communs aux deux plateformes, toutes catégories confondues
+(cryptos, actions, indices, matières premières, FX, etc.).
 L'environnement cible est le **mainnet**, sans testnet.
 
 Python 3.11–3.13 (3.12 recommandé sur Ubuntu). La stratégie est dans `main.py`,
@@ -72,8 +73,8 @@ enregistrées dans son journal.
 
 ## Entrée et sélection
 
-- Actions et matières premières communes uniquement, excluant les cryptos,
-  indices et FX. Vérifier l'identité exacte du sous-jacent et les caractéristiques
+- Toutes les catégories de marchés communs : cryptos, actions, indices,
+  matières premières, FX, etc. Vérifier l'identité exacte du sous-jacent et les caractéristiques
   du contrat. Pas de substitution ETF/métal : GLD n'est pas XAU. Les marchés
   disponibles sur Robinhood Chain doivent être vérifiés auprès de son API.
 - Taux horaires en fractions : `nextFundingRate` sur Arcus et

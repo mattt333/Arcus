@@ -129,13 +129,32 @@ class StrategyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Slippage"):
                     entry_plan(a, e, (deep, book()), 1)
 
-    def test_crypto_and_different_underlyings_excluded(self):
+    def test_all_common_market_categories_are_eligible(self):
+        for category, symbol in (("EQUITIES", "NVDA"), ("CRYPTO", "BTC"),
+                                 ("INDICES", "SPX"), ("COMMODITIES", "XAU"),
+                                 ("FX", "EUR"), ("OTHER", "OTHER")):
+            with self.subTest(category=category):
+                a, e = market_info()
+                a.update(category=category, marketDisplayName=symbol + "-USD")
+                e.update(name=symbol + "-USD", symbol=symbol)
+                self.assertEqual(match_markets([a], [e]), {symbol + "-USD": (a, e)})
+
+    def test_different_underlyings_excluded(self):
         a, e = market_info()
-        self.assertEqual(match_markets([a], [e])["NVDA-USD"][1]["name"], "NVDA-USD")
-        a["category"] = "CRYPTO"
-        self.assertFalse(match_markets([a], [e]))
         a["category"] = "COMMODITIES"; a["marketDisplayName"] = "GLD-USD"
         e["name"] = "XAU-USD"; e["symbol"] = "XAU"
+        self.assertFalse(match_markets([a], [e]))
+
+    def test_common_markets_require_active_compatible_contracts(self):
+        for changes in ({"status": "inactive"}, {"market_type": "spot"},
+                        {"multiplier": "1000"}, {"quote_multiplier": 1000},
+                        {"is_frozen": True}, {"market_config": {"force_reduce_only": True}}):
+            with self.subTest(changes=changes):
+                a, e = market_info()
+                e.update(changes)
+                self.assertFalse(match_markets([a], [e]))
+        a, e = market_info()
+        a["status"] = "OFFLINE"
         self.assertFalse(match_markets([a], [e]))
 
     def test_liquidation_before_ten_percent_move(self):

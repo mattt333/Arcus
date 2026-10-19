@@ -1,4 +1,4 @@
-"""Arbitrage de funding Arcus / Lighter, uniquement sur les RWA communs."""
+"""Arbitrage de funding Arcus / Lighter sur tous les marchés communs."""
 import asyncio
 import json
 import logging
@@ -53,7 +53,7 @@ def relative_gap(a, b):
 def match_markets(arcus, lighter):
     result = {}
     for a in arcus:
-        if a["category"] not in ("EQUITIES", "COMMODITIES") or a["status"] != "ONLINE":
+        if a["status"] != "ONLINE":
             continue
         symbol = a["marketDisplayName"]
         candidates = [e for e in lighter if e["name"] == symbol
@@ -503,7 +503,7 @@ class Farmer:
             if symbol not in self.pairs:
                 await self.close_pair(symbol, "marché ou funding devenu indisponible")
         self.save()
-        log.info("%s RWA communs ; %s paires ouvertes ; %s candidats avec historique de 4 h valide",
+        log.info("%s marchés communs ; %s paires ouvertes ; %s candidats avec historique de 4 h valide",
                  len(self.pairs), len(self.state["active"]), len(ranked))
         for score, symbol, orientation, a, e in sorted(ranked, reverse=True, key=lambda x: x[0]):
             if len(self.state["active"]) >= MAX_PAIRS or self.stop.is_set():
