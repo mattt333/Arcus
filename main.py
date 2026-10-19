@@ -13,8 +13,8 @@ from pathlib import Path
 from exchanges import Arcus, Lighter, Http, ApiError, TERMINAL, UncertainOrder, wait_position, check_book_spread, MAX_SPREAD, OPEN_SLIPPAGE
 
 D = Decimal
-POSITION_USD = D(os.getenv("POSITION_USD", "100"))
-MAX_PAIRS = int(os.getenv("MAX_PAIRS", "2"))
+POSITION_USD = D(os.getenv("POSITION_USD", "200"))
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", "3"))
 MIN_FUNDING_GAP = D(os.getenv("MIN_FUNDING_GAP", "0.30"))
 HISTORY_SECONDS = 4 * 3600  # Stabilite minimale avant ouverture.
 MAX_PRICE_MOVE = D("0.10")

@@ -21,8 +21,8 @@ export LIGHTER_ACCOUNT_INDEX='...'
 export LIGHTER_API_KEY_INDEX='...'
 export LIGHTER_API_PRIVATE_KEY='...'
 
-export POSITION_USD='100'
-export MAX_PAIRS='2'
+export POSITION_USD='200'
+export MAX_PAIRS='3'
 .venv/bin/python main.py
 ```
 
@@ -109,11 +109,22 @@ enregistrées dans son journal.
   exchanges. Verifier la profondeur pour la quantite entiere et relire le
   carnet juste avant ouverture. Le slippage de profondeur conserve son
   seuil distinct de 0,05 % a l'entree.
-- Environ 100 $ de notionnel par jambe, indépendamment du levier. Utiliser la
+- Environ 200 $ de notionnel par jambe, indépendamment du levier. Utiliser la
   même quantité d'actif des deux côtés, arrondie au pas commun. Ignorer la
   paire si les minimums ne permettent pas cette taille.
-- Maximum de deux paires distinctes ; conserver une paire ouverte jusqu'à
+- Maximum de trois paires distinctes ; conserver une paire ouverte jusqu'à
   ce qu'un critère de sortie soit atteint.
+
+Le bot choisit le levier entier maximal déduit des exigences de marge du
+marché, sur chaque plateforme, en marge isolée. La marge initiale est donc
+approximativement le notionnel divisé par ce levier. À 20×, une jambe de
+200 $ demande environ 10 $ de marge initiale, soit 30 $ par plateforme
+pour trois paires ; à 5×, il faut environ 120 $. Prévoir en plus les frais,
+les fundings et les pertes sur chaque plateforme. Un solde de 300 $ par
+plateforme couvre ces exemples, mais la marge requise dépend des marchés.
+Le bot ne vérifie pas le solde disponible avant ouverture et ne répartit
+pas les dépôts supplémentaires entre les marges isolées : déposer davantage
+ne protège donc pas automatiquement les positions existantes de la liquidation.
 
 Confirmer le levier et le mode de marge avant ouverture. Arcus utilise la
 marge isolée. Sur Lighter, les précisions de prix et de quantité proviennent
@@ -220,8 +231,8 @@ après redémarrage.
 
 | Variable | Défaut | Sens |
 |---|---|---|
-| `POSITION_USD` | `100` | Notionnel maximal par jambe |
-| `MAX_PAIRS` | `2` | Nombre maximal de paires ouvertes |
+| `POSITION_USD` | `200` | Notionnel maximal par jambe |
+| `MAX_PAIRS` | `3` | Nombre maximal de paires ouvertes |
 | `MIN_FUNDING_GAP` | `0.30` | Écart relatif de funding |
 | `MAX_SPREAD` | `0.0003` | Spread bid/ask uniquement ; plafond 0,03 %, configurable plus bas |
 | `STATE_FILE` | `funding-state.json` | Fichier d'état |

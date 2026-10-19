@@ -97,8 +97,9 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(common_step(D(".006"), D(".004")), D(".012"))
         a, e = market_info()
         quantity = entry_plan(a, e, (book(), book()), 1)
-        self.assertEqual(quantity, D(".99"))
-        self.assertLessEqual(quantity * D("100.01"), D(100))
+        expected = (main.POSITION_USD / D("100.01") // D(".01")) * D(".01")
+        self.assertEqual(quantity, expected)
+        self.assertLessEqual(quantity * D("100.01"), main.POSITION_USD)
         self.assertEqual(quantity % D(a["stepSize"]), 0)
         self.assertEqual(quantity % D(e["stepSize"]), 0)
 
