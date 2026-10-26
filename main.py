@@ -153,6 +153,53 @@ class MarketMaker:
         return [o for o in self.state["orders"] if o["status"] not in TERMINAL
                 and (kind is None or o["kind"] == kind)]
 
+    def pin_exit_price(self, entry_order):
+        side = -entry_order["side"]
+        if self.state.get("exit_side") == side and "exit_price" in self.state:
+            return D(self.state["exit_price"])
+
+        def profitable(price):
+            return price is not None and side * (D(price) - D(entry_order["price"])) < 0
+
+        # Prendre l'ordre opposé effectivement présent au fill, ou le prix de
+        # la paire enregistré avant l'envoi si le deuxième ordre n'existe pas.
+        active = [o for o in self.live("quote") if o["side"] == side
+                  and not o["reduce_only"] and profitable(o["price"])]
+        price = active[0]["price"] if active else entry_order.get("opposite_price")
+        if not profitable(price):
+            # Reprise d'un ancien journal : retrouver la quote d'origine près
+            # de l'entrée, plutôt qu'une sortie reduce-only déjà déplacée.
+            orders = self.state["orders"]
+            entry_index = orders.index(entry_order)
+            candidates = [(abs(i - entry_index), o) for i, o in enumerate(orders)
+                          if o["kind"] == "quote" and o["side"] == side
+                          and not o["reduce_only"] and o["status"] != "REJECTED"
+                          and profitable(o["price"])]
+            if candidates:
+                price = min(candidates, key=lambda candidate: candidate[0])[1]["price"]
+            else:
+                price = self.state.get("exit_price")
+        if not profitable(price):
+            return None
+        self.state.update(exit_price=str(price), exit_side=side)
+        self.save()
+        self.audit("exit_price_locked", entry_id=entry_order["id"], side=side, price=price)
+        log.info("Prix de sortie figé : %s XAU à %s ; entrée %s",
+                 "vente" if side == -1 else "achat", price, entry_order["id"])
+        return D(price)
+
+    def position_exit_price(self, size):
+        side = -1 if size > 0 else 1
+        if self.state.get("exit_side") == side and "exit_price" in self.state:
+            return D(self.state["exit_price"])
+        entry = next((o for o in self.state["orders"] if o["kind"] == "quote"
+                      and o["side"] == -side and D(o["filled"]) > 0), None)
+        price = self.pin_exit_price(entry) if entry else None
+        if price is None:
+            raise UncertainOrder("Prix opposé d'origine introuvable ; sortie limite suspendue, "
+                                 "stop toujours surveillé")
+        return price
+
     def update(self, order, row):
         if row is None:
             raise UncertainOrder(f"Ordre {order['id']} invisible ; nouvelles cotations suspendues")
@@ -161,8 +208,9 @@ class MarketMaker:
         if filled < previous or filled > D(order["quantity"]):
             raise ValueError("Quantité exécutée incohérente")
         delta = filled - previous
+        previous_size = D(self.state["expected_size"])
         if delta:
-            expected = D(self.state["expected_size"]) + order["side"] * delta
+            expected = previous_size + order["side"] * delta
             self.state["expected_size"] = str(expected)
             self.state["cycle_filled"] = True
         order.update(status=row["status"], filled=str(filled))
@@ -170,6 +218,9 @@ class MarketMaker:
             order["order_index"] = row["order_index"]
         self.save()
         if delta:
+            if order["kind"] == "quote" and expected and previous_size * expected <= 0:
+                # Figer la cible avant les lectures suivantes ou une annulation.
+                self.pin_exit_price(order)
             self.audit("fill", id=order["id"], side=order["side"], quantity=delta, expected=expected)
 
     async def refresh(self):
@@ -203,7 +254,7 @@ class MarketMaker:
         if failures:
             raise UncertainOrder("; ".join(failures))
 
-    async def place(self, kind, side, quantity, price, reduce_only=False):
+    async def place(self, kind, side, quantity, price, reduce_only=False, opposite_price=None):
         retry = self.state.get("quote_retry", {}).get(str(side), {}) if kind == "quote" else {}
         if time.time() < retry.get("retry_at", 0):
             raise QuoteRetryPending("Nouvelle tentative de quote différée après refus explicite")
@@ -213,6 +264,8 @@ class MarketMaker:
                  "filled": "0", "status": "PENDING"}
         if kind == "quote":
             order["expires_at_ms"] = int(time.time() * 1000) + QUOTE_TTL_SECONDS * 1000
+            if opposite_price is not None:
+                order["opposite_price"] = str(opposite_price)
         self.state["orders"].append(order)
         self.save()  # Enregistrer AVANT tout appel réseau.
         self.audit("order_requested", order=order)
@@ -356,6 +409,7 @@ class MarketMaker:
         if self.state["orders"]:
             self.audit("cycle_closed", orders=self.state["orders"])
         self.state.pop("exit_price", None)
+        self.state.pop("exit_side", None)
         self.state.pop("quote_retry", None)
         self.state.update(orders=[], cycle_quantity=None, cycle_filled=False, phase="quoting")
         self.save()
@@ -398,6 +452,7 @@ class MarketMaker:
 
         if size:
             entry_side = 1 if size > 0 else -1
+            price = self.position_exit_price(size)
             # Dès le premier fill, supprimer tout reliquat dans le même sens.
             same_side = [o for o in self.live("quote") if o["side"] == entry_side]
             if same_side:
@@ -410,37 +465,23 @@ class MarketMaker:
                     await self.cancel_quotes("position soldée pendant l'annulation")
                     return
                 entry_side = 1 if size > 0 else -1
+                price = self.position_exit_price(size)
             opposite = [o for o in self.live("quote") if o["side"] == -entry_side]
             if len(opposite) > 1:
                 raise RuntimeError("Plusieurs ordres de sortie détectés")
-            price = book[side_name(-entry_side)][0][0]
-            previous_exit = next((o for o in reversed(self.state["orders"])
-                                  if o["kind"] == "quote" and o["side"] == -entry_side), None)
-            if previous_exit:
-                # Une expiration ne déplace pas le prix de la sortie conservée.
-                self.state["exit_price"] = previous_exit["price"]
-                self.save()
             if opposite:
                 order = opposite[0]
-                price = D(order["price"])
                 remaining = D(order["quantity"]) - D(order["filled"])
+                if D(order["price"]) != price:
+                    await self.cancel(order, "retour au prix opposé figé au fill")
+                    return
                 # Garder l'ordre et son prix tant qu'il ne peut pas inverser la position.
                 if remaining > abs(size) and not order["reduce_only"]:
                     await self.cancel(order, "redimensionnement après fill partiel")
-                    self.state["exit_price"] = str(price)
-                    self.save()
                     return
-                if liquidity(book, -entry_side, price) < MIN_LIQUIDITY_USD:
-                    await self.cancel(order, "liquidité au tick inférieure à 100 $")
                 return
-            price = D(self.state.get("exit_price", price))
-            if liquidity(book, -entry_side, price) < MIN_LIQUIDITY_USD:
-                price = book[side_name(-entry_side)][0][0]
-            if liquidity(book, -entry_side, price) >= MIN_LIQUIDITY_USD:
-                quantity = reduce_only_quantity(self.market, abs(size), price)
-                await self.place("quote", -entry_side, quantity, price, reduce_only=True)
-                self.state.pop("exit_price", None)
-                self.save()
+            quantity = reduce_only_quantity(self.market, abs(size), price)
+            await self.place("quote", -entry_side, quantity, price, reduce_only=True)
             return
 
         if self.state["cycle_filled"]:
@@ -489,7 +530,8 @@ class MarketMaker:
                 if (fresh[side_name(side)][0][0] != price
                         or liquidity(fresh, side, price) < MIN_LIQUIDITY_USD):
                     return
-                await self.place("quote", side, quantity, price)
+                await self.place("quote", side, quantity, price,
+                                 opposite_price=ask if side == 1 else bid)
                 if self.state["cycle_filled"]:
                     return
 

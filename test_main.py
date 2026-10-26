@@ -623,16 +623,148 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(D(self.quote(1)["price"]), D("3000.46"))
         self.assertEqual(D(self.quote(-1)["price"]), D("3000.56"))
 
-    async def test_exit_also_respects_liquidity_rule(self):
+    async def test_exit_is_kept_when_liquidity_disappears_at_its_tick(self):
         await self.start()
         ask = deepcopy(self.quote(-1))
         self.exchange.fill(self.quote(1)["id"])
         self.exchange.depth = book("3000.45", "3000.60")
         await self.maker.step()
-        self.assertIn(ask["id"], self.exchange.canceled)
         await self.maker.step()
-        self.assertEqual(D(self.quote(-1)["price"]), D("3000.60"))
+        self.assertNotIn(ask["id"], self.exchange.canceled)
+        self.assertEqual(self.quote(-1)["id"], ask["id"])
+        self.assertEqual(self.quote(-1)["price"], ask["price"])
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_long_keeps_spread_exit_when_market_moves_below_entry_until_stop(self):
+        self.exchange.depth = book("4010.61", "4010.81")
+        await self.start()
+        ask = deepcopy(self.quote(-1))
+        self.exchange.fill(self.quote(1)["id"])
+        for bid, offer in (("4010.31", "4010.41"), ("4009.62", "4009.72")):
+            self.exchange.depth = book(bid, offer)
+            await self.maker.step()
+            self.assertEqual(self.quote(-1)["id"], ask["id"])
+            self.assertEqual(self.quote(-1)["price"], "4010.81")
+            self.assertEqual(len(self.exchange.sent), 2)
+        self.exchange.depth = book("4009.61", "4009.71")
+        await self.maker.step()
+        self.assertEqual(self.exchange.sent[-1]["kind"], "close")
+        self.assertEqual(self.exchange.current["size"], 0)
+
+    async def test_short_keeps_original_bid_when_current_bid_would_realize_loss(self):
+        self.exchange.depth = book("4009.80", "4009.94")
+        await self.start()
+        bid = deepcopy(self.quote(1))
+        self.exchange.fill(self.quote(-1)["id"])
+        for _ in range(3):
+            self.exchange.depth = book("4010.08", "4010.20")
+            await self.maker.step()
+        self.assertEqual(self.quote(1)["id"], bid["id"])
+        self.assertEqual(self.quote(1)["price"], "4009.80")
+        self.assertFalse(self.exchange.canceled)
+        self.assertEqual(len(self.exchange.sent), 2)
+        self.exchange.depth = book("4010.84", "4010.94")
+        await self.maker.step()
+        self.assertEqual(self.exchange.sent[-1]["kind"], "close")
+        self.assertEqual(self.exchange.current["size"], 0)
+
+    async def test_expired_exit_returns_to_frozen_price_with_no_liquidity_there(self):
+        await self.start()
+        ask = deepcopy(self.quote(-1))
+        self.exchange.fill(self.quote(1)["id"])
+        await self.maker.step()
+        self.exchange.rows[ask["id"]]["status"] = "EXPIRED"
+        self.exchange.depth = book("3000.20", "3000.30")
+        await self.maker.step()
+        self.assertNotEqual(self.quote(-1)["id"], ask["id"])
+        self.assertEqual(self.quote(-1)["price"], ask["price"])
         self.assertTrue(self.quote(-1)["reduce_only"])
+        self.assertEqual(self.maker.state["exit_price"], ask["price"])
+
+    async def test_partial_fill_recreates_exit_at_original_price_after_market_falls(self):
+        await self.start()
+        ask = deepcopy(self.quote(-1))
+        self.exchange.fill(self.quote(1)["id"], D(".0010"))
+        self.exchange.depth = book("3000.20", "3000.30")
+        await self.maker.step()
+        await self.maker.step()
+        self.assertIn(ask["id"], self.exchange.canceled)
+        self.assertEqual(self.quote(-1)["price"], ask["price"])
+        self.assertTrue(self.quote(-1)["reduce_only"])
+        self.assertEqual(self.exchange.current["size"], D(".0010"))
+
+    async def test_immediate_first_fill_uses_opposite_price_saved_before_submission(self):
+        await self.maker.initialize()
+        original = self.exchange.place
+
+        async def immediate_fill(order):
+            saved = json.loads(self.path.read_text(encoding="utf8"))
+            if order["side"] == 1:
+                self.assertEqual(saved["orders"][-1]["opposite_price"], "3000.55")
+            row = await original(order)
+            if order["side"] == 1:
+                self.exchange.fill(order["id"])
+                row = await self.exchange.order_status(order["id"])
+            return row
+
+        with patch.object(self.exchange, "place", side_effect=immediate_fill):
+            await self.maker.step()
+        self.assertEqual(len(self.exchange.sent), 1)
+        self.exchange.depth = book("3000.20", "3000.30")
+        await self.maker.step()
+        self.assertEqual(self.quote(-1)["price"], "3000.55")
+        self.assertEqual(self.maker.state["exit_price"], "3000.55")
+
+    async def test_frozen_exit_survives_read_failure_cancellation_and_restart(self):
+        await self.start()
+        ask = deepcopy(self.quote(-1))
+        self.exchange.fill(self.quote(1)["id"])
+        with patch.object(self.exchange, "position", side_effect=ApiError("offline")):
+            with self.assertRaises(ApiError):
+                await self.maker.step()
+        await self.maker.cancel_quotes("erreur de lecture")
+        restarted = MarketMaker(self.exchange, self.path)
+        await restarted.initialize()
+        self.exchange.depth = book("3000.20", "3000.30")
+        await restarted.step()
+        exit_order = next(o for o in restarted.live("quote") if o["side"] == -1)
+        self.assertEqual(exit_order["price"], ask["price"])
+        self.assertEqual(restarted.state["exit_price"], ask["price"])
+
+    async def test_legacy_journal_recovers_original_exit_instead_of_repriced_exit(self):
+        await self.start()
+        ask = deepcopy(self.quote(-1))
+        self.exchange.fill(self.quote(1)["id"])
+        await self.maker.refresh()
+        await self.maker.cancel(self.quote(-1), "ancienne règle de liquidité")
+        await self.maker.place("quote", -1, D(".0034"), D("3000.30"), reduce_only=True)
+        self.maker.state.pop("exit_side")
+        self.maker.state["exit_price"] = "3000.30"
+        for order in self.maker.state["orders"]:
+            order.pop("opposite_price", None)
+        self.maker.save()
+        restarted = MarketMaker(self.exchange, self.path)
+        await restarted.initialize()
+        self.exchange.depth = book("3000.20", "3000.30")
+        await restarted.step()
+        await restarted.step()
+        self.assertEqual(restarted.live("quote")[0]["price"], ask["price"])
+        self.assertEqual(restarted.state["exit_price"], ask["price"])
+
+    async def test_missing_original_exit_does_not_follow_market_and_stop_still_works(self):
+        self.seed_missing_quote(status="FILLED", filled=".0034")
+        self.maker.state.update(expected_size=".0034", cycle_filled=True)
+        self.maker.save()
+        self.exchange.current = {"size": D(".0034"), "entry": D("3000.45")}
+        await self.maker.initialize()
+        self.exchange.depth = book("3000.20", "3000.30")
+        with self.assertRaisesRegex(UncertainOrder, "Prix opposé d'origine introuvable"):
+            await self.maker.step()
+        self.assertFalse(self.exchange.sent)
+        self.exchange.depth = book("2999.45", "2999.55")
+        await self.maker.step()
+        self.assertEqual(self.exchange.sent[-1]["kind"], "close")
+        self.assertEqual(self.exchange.current["size"], 0)
 
     async def test_long_stop_cancels_ask_then_closes_reduce_only(self):
         await self.start()

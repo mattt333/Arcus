@@ -12,22 +12,26 @@ ont été retirés.
   confirmée puis un remplacement. Aucun passage taker pour les quotes.
 - Taille cible : **10 $ de notionnel**, avec la même quantité XAU des deux
   côtés pour permettre à l'ordre opposé de solder la position.
-- Un tick doit contenir au moins **100 $ de liquidité des autres comptes**.
+- Pour une nouvelle entrée, un tick doit contenir au moins
+  **100 $ de liquidité des autres comptes**.
   Toutes les quantités au même prix sont additionnées ; les ordres de notre
-  compte sont exclus. Le contrôle porte sur le côté de notre ordre.
-  À exactement 100 $, l'ordre est conservé ; sous 100 $, il est annulé.
+  compte sont exclus. Le contrôle porte sur le côté de notre ordre d'entrée.
+  À exactement 100 $, l'entrée est conservée ; sous 100 $, elle est annulée.
 - Dès un fill, même partiel : annuler le reliquat dans le sens de la
   position et bloquer les nouvelles entrées de ce côté. Il n'y a pas de
   cumul d'ordres pour augmenter l'inventaire.
 - Après un fill complet, conserver l'ordre opposé à son prix initial tant
-  que son tick reste admissible, même si le meilleur prix se déplace.
+  que la position reste ouverte, même si le meilleur prix se déplace ou
+  si la liquidité externe disparaît à son tick.
   Après un fill partiel, si cet ordre peut dépasser l'inventaire restant,
   le recréer au même prix en **reduce-only**, pour la quantité restante
   arrondie au minimum accepté par le marché. Un ordre déjà reduce-only
   peut être conservé même si son reliquat dépasse la position.
-- Le seuil de liquidité s'applique également à la sortie. Si son tick
-  devient inadmissible, annuler l'ordre ; le replacer au meilleur prix
-  admissible dès que possible. Le stop continue à être surveillé.
+- Dès le premier fill, figer le prix de l'ordre opposé pour prendre le
+  spread. Une sortie expirée, redimensionnée ou annulée après une erreur
+  de lecture est recréée **au même prix**, en POST_ONLY / reduce-only.
+  La sortie ne suit jamais le meilleur bid/ask courant. Le stop continue
+  à être surveillé pendant toute la position.
 - Stop à **1 $ de variation du prix XAU**, par rapport au prix moyen
   d'entrée exécuté : long si le meilleur bid est inférieur ou égal à
   entrée − 1 ; short si le meilleur ask est supérieur ou égal à entrée + 1.
@@ -139,7 +143,7 @@ La date est transmise en millisecondes Unix. Cette expiration reste un recours
 en cas de perte de contact ; les annulations normales sont gérées à chaque cycle.
 Une quote expirée peut être recréée après réconciliation.
 Le carnet contient au maximum les 250 premiers ordres par côté ; une
-liquidité absente du snapshot est traitée comme insuffisante.
+liquidité absente du snapshot est traitée comme insuffisante pour une entrée.
 
 `xau-mm-state.json` enregistre les identifiants avant chaque envoi, les
 fills confirmés, l'inventaire attendu et une fermeture en cours.
@@ -152,7 +156,18 @@ Au démarrage, le bot réconcilie le journal avec les ordres ouverts,
 l'historique et la position **sans envoyer d'annulation**. Les ordres
 réellement présents sont conservés, y compris l'ordre opposé à une position.
 Le suivi habituel du marché reprend ensuite ; il peut annuler une quote
-dont le prix ou la liquidité ne respecte plus les règles de la stratégie.
+d'entrée dont le prix ou la liquidité ne respecte plus les règles de la stratégie.
+
+Le prix opposé de la paire est enregistré dans `opposite_price` avant chaque
+envoi d'entrée, même si la première quote est exécutée avant la création de
+la seconde. Dès le premier fill, `exit_price` et `exit_side` figent la sortie
+du cycle ; l'événement `exit_price_locked` et le message `Prix de sortie figé`
+en donnent la trace. Cette cible survit aux expirations et aux redémarrages.
+Pour un ancien journal, le bot tente de retrouver la quote opposée d'origine
+parmi les ordres enregistrés, en privilégiant un prix du côté bénéficiaire
+de l'entrée. S'il ne peut retrouver de cible, il suspend les nouvelles limites
+de sortie tout en continuant de surveiller le stop ; il ne choisit pas le
+meilleur prix courant comme cible de remplacement.
 
 Un 429, une erreur de lecture, un ordre incertain ou un écart de position
 pendant l'initialisation suspend le démarrage dans le même processus, au
