@@ -143,13 +143,17 @@ class MarketMaker:
             self.state["expected_size"] = str(expected)
             self.state["cycle_filled"] = True
         order.update(status=row["status"], filled=str(filled))
+        if "order_index" in row:
+            order["order_index"] = row["order_index"]
         self.save()
         if delta:
             self.audit("fill", id=order["id"], side=order["side"], quantity=delta, expected=expected)
 
     async def refresh(self):
-        for order in list(self.live()):
-            self.update(order, await self.exchange.order_status(order["id"]))
+        orders = list(self.live())
+        rows = await self.exchange.order_statuses([order["id"] for order in orders])
+        for order in orders:
+            self.update(order, rows[order["id"]])
 
     async def position(self):
         position = await self.exchange.position()
@@ -414,7 +418,7 @@ class MarketMaker:
                     return
             except Exception:
                 log.exception("Arrêt : annulation ou fermeture à retenter")
-            await asyncio.sleep(POLL_SECONDS)
+            await asyncio.sleep(max(POLL_SECONDS, self.exchange.retry_after))
         raise RuntimeError("URGENT : vérifier XAU sur Lighter ; fermeture non confirmée")
 
     async def run(self):
@@ -433,7 +437,7 @@ class MarketMaker:
                         log.exception("URGENT : annulation non confirmée ; expiration prévue des quotes "
                                       "au plus tard %s s après leur création", QUOTE_TTL_SECONDS)
                 try:
-                    await asyncio.wait_for(self.stop.wait(), POLL_SECONDS)
+                    await asyncio.wait_for(self.stop.wait(), max(POLL_SECONDS, self.exchange.retry_after))
                 except TimeoutError:
                     pass
         finally:

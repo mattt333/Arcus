@@ -101,8 +101,27 @@ journal XAU. Un journal d'une autre stratégie ou d'un autre compte est refusé.
 
 Le bot interroge le carnet, les ordres et la position par REST, avec une
 pause de **0,5 seconde entre les cycles**. Les temps réseau et les délais
-de confirmation s'ajoutent à cette pause. Ce n'est pas un flux WebSocket :
+de confirmation s'ajoutent à cette pause. Les départs des lectures REST sont
+espacés d'au moins **0,5 seconde**, tous endpoints confondus dans ce processus.
+Chaque rafraîchissement regroupe le suivi des ordres : une lecture des ordres
+actifs, puis une pagination commune de l'historique pour les références absentes.
+Les confirmations sont également interrogées au plus toutes les 0,5 seconde.
+Un cycle avec ordres actifs, position et carnet prend donc au moins environ
+1,5 seconde, hors délais réseau et opérations supplémentaires.
+Ce n'est pas un flux WebSocket :
 les annulations et le stop interviennent au moment de l'observation.
+
+Un HTTP **429** suspend les lectures REST. Le délai respecte `Retry-After`
+(secondes ou date HTTP), avec un minimum progressif de **5, 10, 20, 40 puis
+60 secondes** si les refus se répètent ; une lecture réussie réinitialise ce
+minimum. Un `Retry-After` plus long est respecté. La boucle attend ce délai
+avant de reprendre, sans multiplier les lectures refusées. L'envoi d'une
+annulation reste tenté via le SDK, avec l'index serveur conservé dans le
+journal ou l'identifiant client ; elle reste incertaine jusqu'à une lecture
+confirmant son état terminal. Aucune nouvelle quote n'est placée tant que
+la réconciliation échoue. Pendant la suspension, le stop géré par le bot
+ne peut pas suivre le marché. Cette cadence réduit les requêtes ; elle ne
+garantit pas l'absence de 429, notamment si d'autres clients partagent le quota.
 
 Les quotes expirent 6 minutes après leur création. Lighter impose un délai
 minimal de 5 minutes ; la minute supplémentaire couvre les délais d'envoi.

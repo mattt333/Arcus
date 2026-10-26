@@ -1,13 +1,18 @@
 """Accès Lighter Robinhood Chain pour le market making XAU."""
 import asyncio
+import math
 import os
 import time
 from decimal import Decimal as D
+from email.utils import parsedate_to_datetime
 
 import aiohttp
 
 TIMEOUT = 10
 ORDER_TIMEOUT = 10
+READ_INTERVAL_SECONDS = 0.5
+RATE_LIMIT_BACKOFF_SECONDS = 5
+MAX_RATE_LIMIT_BACKOFF_SECONDS = 60
 # Lighter requires at least 5 minutes, in Unix milliseconds:
 # https://github.com/elliottech/lighter-go/blob/main/types/txtypes/constants.go
 # Allow another minute for signing, transmission and clock differences.
@@ -19,6 +24,10 @@ TERMINAL = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "ABSENT"}
 
 class ApiError(RuntimeError):
     pass
+
+
+class RateLimited(ApiError):
+    """Les lectures REST sont suspendues jusqu'à la fin du délai de quota."""
 
 
 class OrderRejected(ApiError):
@@ -37,6 +46,32 @@ def decimal(value, positive=False):
 
 
 class Http:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.next_read = 0
+        self.blocked_until = 0
+        self.backoff = RATE_LIMIT_BACKOFF_SECONDS
+
+    @property
+    def retry_after(self):
+        return max(0, self.blocked_until - time.monotonic())
+
+    def rate_limited(self, header):
+        delay = self.backoff
+        if header:
+            try:
+                requested = float(header)
+            except ValueError:
+                try:
+                    requested = parsedate_to_datetime(header).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    requested = 0
+            if math.isfinite(requested):
+                delay = max(delay, requested)
+        self.blocked_until = time.monotonic() + delay
+        self.backoff = min(self.backoff * 2, MAX_RATE_LIMIT_BACKOFF_SECONDS)
+        return RateLimited(f"Lighter HTTP 429 : lectures suspendues pendant {delay:.1f} s")
+
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=TIMEOUT))
         return self
@@ -45,12 +80,26 @@ class Http:
         await self.session.close()
 
     async def get(self, url, params, headers=None):
+        async with self.lock:
+            if self.retry_after:
+                raise RateLimited(f"Lighter HTTP 429 : reprise des lectures dans {self.retry_after:.1f} s")
+            await asyncio.sleep(max(0, self.next_read - time.monotonic()))
+            self.next_read = time.monotonic() + READ_INTERVAL_SECONDS
+            return await self.read(url, params, headers)
+
+    async def read(self, url, params, headers):
         try:
             async with self.session.get(url, params=params, headers=headers) as response:
+                # Un proxy peut renvoyer du texte ou du HTML pour un 429.
+                if response.status == 429:
+                    raise self.rate_limited(response.headers.get("Retry-After"))
                 data = await response.json(content_type=None)
+                if isinstance(data, dict) and data.get("code") == 429:
+                    raise self.rate_limited(response.headers.get("Retry-After"))
                 if (response.status >= 400 or not isinstance(data, dict)
                         or data.get("code", 200) != 200 or data.get("error")):
                     raise ApiError(f"Lighter HTTP {response.status} : réponse refusée")
+                self.backoff = RATE_LIMIT_BACKOFF_SECONDS
                 return data
         except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
             raise ApiError("Lecture Lighter indisponible") from exc
@@ -85,6 +134,10 @@ class Lighter:
     async def close(self):
         if self.signer is not None:
             await self.signer.close()
+
+    @property
+    def retry_after(self):
+        return self.http.retry_after
 
     async def get(self, path, private=False, **params):
         headers = None
@@ -128,7 +181,7 @@ class Lighter:
                    and decimal(row["initial_margin_fraction"]) == expected
                    for row in await self.account_rows()):
                 return
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(READ_INTERVAL_SECONDS)
         raise ApiError("Levier et marge isolée Lighter non confirmés")
 
     async def account_rows(self):
@@ -194,20 +247,32 @@ class Lighter:
         return [self.normalize(row) for row in data["orders"]]
 
     async def order_status(self, client_id):
+        return (await self.order_statuses([client_id]))[client_id]
+
+    async def order_statuses(self, client_ids):
+        """Un snapshot actif et une seule pagination d'historique par lot."""
+        result = dict.fromkeys(client_ids)
+        if not result:
+            return result
         for row in await self.active_orders():
-            if row["client_id"] == client_id:
-                return row
+            if row["client_id"] in result:
+                result[row["client_id"]] = row
+        missing = {key for key, row in result.items() if row is None}
+        if not missing:
+            return result
         cursor, seen = None, set()
         while True:
             data = await self.get("accountInactiveOrders", private=True, account_index=self.account,
                 market_id=self.market["market_id"], limit=100,
                 **({"cursor": cursor} if cursor else {}))
             for row in data["orders"]:
-                if str(row["client_order_index"]) == client_id:
-                    return self.normalize(row)
+                client_id = str(row["client_order_index"])
+                if client_id in missing:
+                    result[client_id] = self.normalize(row)
+                    missing.remove(client_id)
             cursor = data.get("next_cursor")
-            if not cursor:
-                return None
+            if not missing or not cursor:
+                return result
             if cursor in seen:
                 raise ApiError("Pagination des ordres bloquée")
             seen.add(cursor)
@@ -220,7 +285,7 @@ class Lighter:
             if row and (row["status"] in TERMINAL or
                         (not terminal and row["status"] == "OPEN")):
                 return row
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(READ_INTERVAL_SECONDS)
         status = row["status"] if row else "absent des ordres ouverts et de l'historique"
         raise UncertainOrder(f"Ordre {client_id} non confirmé : {status}")
 
@@ -278,11 +343,16 @@ class Lighter:
                 f"Ordre {order['id']} non confirmé ; envoi={order['submission']} ; {exc}") from exc
 
     async def cancel(self, order):
-        row = await self.order_status(order["id"])
+        try:
+            row = await self.order_status(order["id"])
+        except RateLimited:
+            # Le quota REST ne doit pas empêcher l'envoi de l'annulation.
+            # Son résultat devra toujours être confirmé après la suspension.
+            row = None
         if row and row["status"] in TERMINAL:
             return row
         client = self.client()
-        index = int(row["order_index"]) if row else int(order["id"])
+        index = int(row["order_index"]) if row else int(order.get("order_index", order["id"]))
         try:
             async with self.lock, asyncio.timeout(TIMEOUT):
                 _, response, error = await client.cancel_order(

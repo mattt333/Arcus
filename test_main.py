@@ -7,9 +7,9 @@ from copy import deepcopy
 from decimal import Decimal as D
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-from exchanges import Lighter, OrderRejected, TERMINAL, UncertainOrder
+from exchanges import ApiError, Http, Lighter, OrderRejected, RateLimited, TERMINAL, UncertainOrder
 from main import MarketMaker, QuoteUnavailable, ReadModelLag, quote_quantity, state_lock, stop_hit
 
 
@@ -29,6 +29,7 @@ def book(bid="3000.45", ask="3000.55"):
 
 class FakeLighter:
     identity = "fake/lighter/466324/1"
+    retry_after = 0
 
     def __init__(self):
         self.market = market()
@@ -49,6 +50,9 @@ class FakeLighter:
 
     async def order_status(self, client_id):
         return deepcopy(self.rows.get(client_id))
+
+    async def order_statuses(self, client_ids):
+        return {key: await self.order_status(key) for key in client_ids}
 
     async def place(self, order):
         self.sent.append(deepcopy(order))
@@ -137,6 +141,99 @@ class SizingTests(unittest.TestCase):
         self.assertTrue(stop_hit(short, book("3001.45", "3001.55")))
 
 
+class HttpTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.now = 100.0
+        clock = patch("exchanges.time", SimpleNamespace(monotonic=lambda: self.now, time=time.time))
+        clock.start()
+        self.addCleanup(clock.stop)
+
+        async def sleep(delay):
+            self.now += delay
+
+        sleeper = patch("exchanges.asyncio.sleep", side_effect=sleep)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+        self.http = Http()
+        self.http.session = SimpleNamespace(get=Mock())
+
+    def respond(self, status=200, data=None, headers=None):
+        response = SimpleNamespace(status=status, headers=headers or {},
+                                   json=AsyncMock(return_value=data or {"code": 200}))
+        context = MagicMock()
+        context.__aenter__.return_value = response
+        self.http.session.get.return_value = context
+        return response
+
+    async def test_429_html_respects_retry_after_and_blocks_all_rest_reads(self):
+        response = self.respond(429, headers={"Retry-After": "30"})
+        response.json.side_effect = ValueError("HTML rate limit page")
+        with self.assertRaises(RateLimited):
+            await self.http.get("active", {})
+        response.json.assert_not_awaited()
+        self.assertEqual(self.http.retry_after, 30)
+        with self.assertRaises(RateLimited):
+            await self.http.get("book", {})
+        self.http.session.get.assert_called_once()
+        self.now += 30
+        self.respond()
+        self.assertEqual(await self.http.get("active", {}), {"code": 200})
+
+    async def test_repeated_429_back_off_and_success_resets_delay(self):
+        for delay in (5, 10, 20, 40, 60, 60):
+            self.respond(429)
+            with self.assertRaises(RateLimited):
+                await self.http.get("active", {})
+            self.assertEqual(self.http.retry_after, delay)
+            self.now += delay
+        self.respond()
+        await self.http.get("active", {})
+        self.respond(429)
+        with self.assertRaises(RateLimited):
+            await self.http.get("active", {})
+        self.assertEqual(self.http.retry_after, 5)
+
+    async def test_http_date_retry_after_is_respected(self):
+        self.respond(429, headers={"Retry-After": "Mon, 26 Oct 2026 12:00:30 GMT"})
+        with patch("exchanges.time.time", return_value=1793016000):
+            with self.assertRaises(RateLimited):
+                await self.http.get("active", {})
+        self.assertEqual(self.http.retry_after, 30)
+
+    async def test_invalid_retry_after_uses_fallback(self):
+        for header in ("invalid", "nan", "inf", "-1"):
+            http = Http()
+            http.session = self.http.session
+            self.respond(429, headers={"Retry-After": header})
+            with self.assertRaises(RateLimited):
+                await http.get("active", {})
+            self.assertEqual(http.retry_after, 5)
+
+    async def test_json_rate_limit_code_also_suspends_reads(self):
+        self.respond(data={"code": 429})
+        with self.assertRaises(RateLimited):
+            await self.http.get("active", {})
+        self.assertEqual(self.http.retry_after, 5)
+
+    async def test_successful_volume_quota_message_is_accepted(self):
+        data = {"code": 200, "ratelimit": "didn't use volume quota"}
+        self.respond(data=data)
+        self.assertEqual(await self.http.get("active", {}), data)
+
+    async def test_rest_requests_are_spaced_across_endpoints(self):
+        self.respond()
+        sent = []
+        context = self.http.session.get.return_value
+        self.http.session.get.side_effect = lambda *a, **k: (sent.append(self.now) or context)
+        await asyncio.gather(*(self.http.get(url, {}) for url in ("active", "book", "account")))
+        self.assertEqual(sent, [100, 100.5, 101])
+
+    async def test_other_http_error_is_still_an_api_failure(self):
+        self.respond(503)
+        with self.assertRaises(ApiError):
+            await self.http.get("active", {})
+
+
 class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -184,6 +281,47 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(3):
             await self.maker.step()
         self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_refresh_reads_both_orders_in_one_batch(self):
+        await self.start()
+        batch = AsyncMock(wraps=self.exchange.order_statuses)
+        self.exchange.order_statuses = batch
+        await self.maker.refresh()
+        batch.assert_awaited_once_with([order["id"] for order in self.maker.live()])
+
+    async def test_rate_limited_refresh_preserves_live_orders_and_inventory(self):
+        await self.start()
+        before = deepcopy(self.maker.state)
+        self.exchange.order_statuses = AsyncMock(side_effect=RateLimited("429"))
+        with self.assertRaises(RateLimited):
+            await self.maker.step()
+        self.assertEqual(self.maker.state, before)
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_run_waits_for_quota_before_next_cycle(self):
+        self.maker.initialize = AsyncMock()
+        self.maker.initialized = True
+        self.maker.shutdown = AsyncMock()
+        self.maker.step = AsyncMock(side_effect=RateLimited("429"))
+        self.maker.cancel_quotes = AsyncMock(side_effect=UncertainOrder("confirmation 429"))
+        self.exchange.retry_after = 30
+
+        async def wait_for_stop(event, delay):
+            self.assertEqual(delay, 30)
+            self.maker.stop.set()
+            await event
+
+        with patch("main.asyncio.wait_for", side_effect=wait_for_stop), self.assertLogs("xau-mm"):
+            await self.maker.run()
+        self.maker.step.assert_awaited_once()
+        self.maker.cancel_quotes.assert_awaited_once()
+
+    async def test_server_order_index_is_persisted_for_cancellation(self):
+        await self.start()
+        order = self.quote(1)
+        self.maker.update(order, {"status": "OPEN", "filled": "0", "order_index": 987})
+        saved = json.loads(self.path.read_text(encoding="utf8"))
+        self.assertEqual(saved["orders"][0]["order_index"], 987)
 
     async def test_full_long_fill_keeps_original_ask_and_no_new_bid(self):
         await self.start()
@@ -812,6 +950,61 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.confirm.return_value = {"status": "CANCELED", "filled": "0"}
         await adapter.cancel(self.order())
         self.assertEqual(adapter.signer.cancel_order.call_args.kwargs["order_index"], 123)
+
+    async def test_cancel_sends_despite_rest_quota_and_keeps_confirmation_uncertain(self):
+        for fields, expected_index in (({"order_index": 999}, 999), ({}, 123)):
+            adapter = self.adapter()
+            adapter.order_status = AsyncMock(side_effect=RateLimited("429"))
+            adapter.confirm.side_effect = RateLimited("429")
+            with self.assertRaisesRegex(UncertainOrder, "429"):
+                await adapter.cancel(self.order(**fields))
+            adapter.signer.cancel_order.assert_awaited_once_with(market_index=40, order_index=expected_index)
+            adapter.confirm.assert_awaited_once_with("123", terminal=True)
+
+    async def test_batch_status_uses_one_active_snapshot_and_shared_history(self):
+        adapter = self.adapter()
+        adapter.active_orders = AsyncMock(return_value=[{"client_id": "123", "status": "OPEN"}])
+        adapter.get = AsyncMock(side_effect=[
+            {"orders": [{"client_order_index": 456, "status": "filled", "filled_base_amount": ".0034"}],
+             "next_cursor": "page2"},
+            {"orders": [{"client_order_index": 789, "status": "canceled", "filled_base_amount": "0"}]}
+        ])
+        rows = await adapter.order_statuses(["123", "456", "789", "absent"])
+        self.assertEqual(rows["123"]["status"], "OPEN")
+        self.assertEqual(rows["456"]["status"], "FILLED")
+        self.assertEqual(rows["789"]["status"], "CANCELED")
+        self.assertIsNone(rows["absent"])
+        adapter.active_orders.assert_awaited_once()
+        self.assertEqual(adapter.get.await_count, 2)
+        self.assertEqual(adapter.get.call_args.kwargs["cursor"], "page2")
+
+    async def test_batch_of_open_orders_does_not_read_history(self):
+        adapter = self.adapter()
+        adapter.active_orders = AsyncMock(return_value=[{"client_id": "123"}, {"client_id": "456"}])
+        adapter.get = AsyncMock()
+        rows = await adapter.order_statuses(["123", "456"])
+        self.assertEqual(set(rows), {"123", "456"})
+        adapter.active_orders.assert_awaited_once()
+        adapter.get.assert_not_awaited()
+
+    async def test_empty_batch_sends_no_request(self):
+        adapter = self.adapter()
+        adapter.active_orders = AsyncMock()
+        self.assertEqual(await adapter.order_statuses([]), {})
+        adapter.active_orders.assert_not_awaited()
+
+    async def test_batch_api_failure_never_becomes_missing_orders(self):
+        adapter = self.adapter()
+        adapter.active_orders = AsyncMock(side_effect=RateLimited("429"))
+        with self.assertRaises(RateLimited):
+            await adapter.order_statuses(["123", "456"])
+
+    async def test_batch_rejects_repeated_history_cursor(self):
+        adapter = self.adapter()
+        adapter.active_orders = AsyncMock(return_value=[])
+        adapter.get = AsyncMock(return_value={"orders": [], "next_cursor": "same"})
+        with self.assertRaisesRegex(ApiError, "Pagination"):
+            await adapter.order_statuses(["123"])
 
     async def test_failed_cancel_exposes_reason_without_marking_order_terminal(self):
         adapter = self.adapter()
