@@ -7,3 +7,7 @@ funding-state.json
 funding-state.tmp
 
 funding-state.orders.jsonl
+xau-mm-state.json
+xau-mm-state.tmp
+xau-mm-state.orders.jsonl
+xau-mm-state.lock
