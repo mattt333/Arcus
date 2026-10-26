@@ -116,9 +116,11 @@ renvoi automatique du même placement. Tant que fills et position ne
 concordent pas, les nouvelles cotations restent suspendues.
 
 Les erreurs de lecture déclenchent une tentative d'annulation des quotes.
-Au redémarrage, les anciennes quotes du journal sont annulées et les
-positions réconciliées avant reprise. Un ordre invisible ou une annulation
-incertaine bloque tout remplacement.
+Au démarrage, le bot réconcilie le journal avec les ordres ouverts,
+l'historique et la position **sans envoyer d'annulation**. Les ordres
+réellement présents sont conservés, y compris l'ordre opposé à une position.
+Le suivi habituel du marché reprend ensuite ; il peut annuler une quote
+dont le prix ou la liquidité ne respecte plus les règles de la stratégie.
 
 Un refus explicite du SDK ou de `sendTx` est enregistré comme `REJECTED`,
 avec son message et son code : il ne provoque pas de recherche ou d'annulation
@@ -126,27 +128,32 @@ d'un ordre inexistant. Une réponse acceptée conserve le hash de transaction ;
 une exception de transport reste incertaine et fait l'objet d'une réconciliation.
 Le résultat d'envoi est conservé dans le champ `submission` du journal.
 
-Un ancien journal peut déjà contenir un ordre `PENDING` dont la réponse a
-été masquée par une version précédente. Le correctif ne le transforme pas
-automatiquement en refus. Le chemin absolu du journal effectivement utilisé
-est affiché au démarrage (`Journal XAU utilisé`) et dans l'erreur de reprise.
-Il peut différer de `xau-mm-state.json` si le service définit `STATE_FILE`.
+Un identifiant enregistré avant l'envoi peut rester `PENDING` sans qu'aucun
+ordre ait jamais été créé sur Lighter. Si une quote est introuvable dans
+les ordres ouverts et l'historique, le bot attend son expiration plus
+5 secondes, puis relit le compte. Les nouvelles quotes conservent leur
+date d'expiration dans le journal avant envoi ; cette même date est transmise
+au SDK. Pour un ancien journal sans date d'expiration, le bot attend une fois
+**65 secondes après son démarrage**.
+
+La référence peut alors être classée localement `ABSENT` uniquement si les
+deux lectures confirment qu'il n'y a aucun ordre ouvert ni aucune position,
+et si la position correspond à l'inventaire attendu. Cette classification
+est conservée dans l'état et l'audit ; elle ne prétend pas qu'une annulation
+ou un refus a été confirmé. Aucune annulation n'est envoyée pour cette référence.
+Le bot peut ensuite reprendre sans renommer ni supprimer le journal.
+
+Une position, un ordre actif, une fermeture MARKET incertaine ou une erreur
+de lecture bloque cette récupération automatique. Une erreur API ne vaut
+jamais absence d'ordre. Un arrêt demandé pendant l'attente interrompt la
+reprise sans supprimer la référence locale.
+
+Le chemin absolu du journal effectivement utilisé est affiché au démarrage
+(`Journal XAU utilisé`). Il peut différer de `xau-mm-state.json` si le service
+définit `STATE_FILE`.
 Un code `200` accompagné de `{"ratelimit": "didn't use volume quota"}`
 est une réponse acceptée avec une information de quota, pas un refus pour
 limite de requêtes ni une preuve d'annulation exécutée.
-Pour repartir avec un journal neuf, arrêter le
-service, attendre au moins une minute pour l'expiration des anciennes quotes,
-puis vérifier sur le même compte Lighter qu'il n'y a **aucun ordre ouvert
-et aucune position**. Uniquement si ces deux conditions sont vérifiées,
-archiver le fichier d'état puis relancer (adapter le chemin si `STATE_FILE`
-est personnalisé) :
-
-```bash
-mv -- xau-mm-state.json "xau-mm-state.before-recovery-$(date +%Y%m%d-%H%M%S).json"
-sudo systemctl start arcus
-```
-
-S'il reste une position ou un ordre, conserver le journal pour réconciliation.
 
 `xau-mm-state.orders.jsonl` conserve les demandes d'ordres, fills,
 annulations, déclenchements du stop et cycles terminés.

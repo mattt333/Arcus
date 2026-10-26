@@ -10,13 +10,15 @@ from contextlib import contextmanager
 from decimal import Decimal as D, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
-from exchanges import Http, Lighter, OrderRejected, TERMINAL, UncertainOrder, decimal
+from exchanges import Http, Lighter, OrderRejected, QUOTE_TTL_SECONDS, TERMINAL, UncertainOrder, decimal
 
 ORDER_USD = D("10")
 MIN_LIQUIDITY_USD = D("100")
 STOP_DISTANCE = D("1")
 POLL_SECONDS = 0.5
 CLOSE_SLIPPAGE = D("0.02")
+RECOVERY_GRACE_SECONDS = 5
+LEGACY_QUOTE_WAIT_SECONDS = QUOTE_TTL_SECONDS + RECOVERY_GRACE_SECONDS
 STATE_FILE = Path(os.getenv("STATE_FILE", "xau-mm-state.json"))
 # 10 $ est une cible : utiliser le premier pas XAU qui atteint ce notionnel.
 ROUND_ORDER_UP = os.getenv("ROUND_ORDER_UP", "1") == "1"
@@ -101,6 +103,7 @@ class MarketMaker:
                     or self.state.get("identity") != exchange.identity):
                 raise ValueError("Journal incompatible avec cette stratégie ou ce compte")
         self.initialized = False
+        self.legacy_recovery_deadline = time.monotonic() + LEGACY_QUOTE_WAIT_SECONDS
 
     def save(self):
         temporary = self.path.with_suffix(".tmp")
@@ -174,6 +177,8 @@ class MarketMaker:
                  "kind": kind, "side": side, "quantity": str(quantity),
                  "price": str(price), "reduce_only": reduce_only,
                  "filled": "0", "status": "PENDING"}
+        if kind == "quote":
+            order["expires_at_ms"] = int(time.time() * 1000) + QUOTE_TTL_SECONDS * 1000
         self.state["orders"].append(order)
         self.save()  # Enregistrer AVANT tout appel réseau.
         self.audit("order_requested", order=order)
@@ -189,23 +194,70 @@ class MarketMaker:
         self.update(order, row)
         return order
 
+    async def startup_snapshot(self):
+        """Lire et réconcilier le compte, sans envoyer ni annuler d'ordre."""
+        known = {o["id"] for o in self.state["orders"]}
+        active = {o["client_id"]: o for o in await self.exchange.active_orders()}
+        if set(active) - known:
+            raise ValueError("Ordres externes détectés : compte dédié XAU requis")
+        missing = []
+        for order in list(self.live()):
+            row = active.get(order["id"])
+            if row is None:
+                row = await self.exchange.order_status(order["id"])
+            if row is None:
+                missing.append(order)
+            else:
+                self.update(order, row)
+                if row["status"] not in TERMINAL:
+                    active[order["id"]] = row
+        return active, missing, await self.position()
+
+    async def reconcile_startup(self):
+        active, missing, position = await self.startup_snapshot()
+        if not missing:
+            return
+        if active or position["size"] or any(o["kind"] != "quote" for o in missing):
+            raise UncertainOrder(
+                "Reprise suspendue : référence introuvable avec un ordre actif, une position "
+                "ou une fermeture incertaine ; aucune annulation envoyée au démarrage")
+
+        delay = max(max(0, o["expires_at_ms"] / 1000 + RECOVERY_GRACE_SECONDS - time.time())
+                    if "expires_at_ms" in o else max(0, self.legacy_recovery_deadline - time.monotonic())
+                    for o in missing)
+        if delay:
+            log.warning("Anciennes quotes introuvables : attente de %.1f s avant vérification du compte ; "
+                        "aucune annulation envoyée", delay)
+            try:
+                await asyncio.wait_for(self.stop.wait(), delay)
+                return
+            except TimeoutError:
+                pass
+
+        # Deuxième lecture complète après expiration : une réponse en panne
+        # ou une position non réconciliée ne peut jamais signifier compte vide.
+        active, missing, position = await self.startup_snapshot()
+        if not missing:
+            return
+        if active or position["size"] or any(o["kind"] != "quote" for o in missing):
+            raise UncertainOrder("Le compte n'est pas vide : références introuvables conservées")
+        for order in missing:
+            order.update(status="ABSENT", recovery={"checked_at": time.time(),
+                "reason": "quote expirée ou non créée ; introuvable ; compte sans ordre ni position"})
+        self.save()
+        for order in missing:
+            self.audit("order_reconciled_absent", order=order)
+            log.warning("Référence locale %s classée ABSENT : aucun ordre ni position sur Lighter ; "
+                        "aucune annulation envoyée", order["id"])
+
     async def initialize(self):
         log.info("Journal XAU utilisé : %s", self.path.resolve())
         self.market = await self.exchange.load_market()
-        known = {o["id"] for o in self.state["orders"]}
-        if any(o["client_id"] not in known for o in await self.exchange.active_orders()):
-            raise ValueError("Ordres externes détectés : compte dédié XAU requis")
-        # Au redémarrage, annuler aussi les placements dont la réponse a été perdue.
-        try:
-            await self.cancel_quotes("démarrage / réconciliation")
-        except UncertainOrder as exc:
-            raise UncertainOrder(
-                f"Reprise bloquée par le journal {self.path.resolve()} : {exc}. "
-                "Aucun nouveau placement envoyé. Conserver le journal tant qu'un ordre "
-                "ou une position subsiste sur le compte ; procédure de reprise dans README.md.") from exc
-        await self.refresh()
+        await self.reconcile_startup()
+        if self.stop.is_set():
+            return
         position = await self.position()
-        if not position["size"]:
+        if not position["size"] and not self.live():
             await self.exchange.set_leverage()
         self.save()
         self.initialized = True
@@ -366,6 +418,8 @@ class MarketMaker:
 
     async def run(self):
         await self.initialize()
+        if not self.initialized:
+            return
         try:
             while not self.stop.is_set():
                 try:

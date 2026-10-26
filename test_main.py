@@ -43,7 +43,8 @@ class FakeLighter:
     async def book(self): return deepcopy(self.depth)
     async def position(self): return deepcopy(self.current)
     async def active_orders(self):
-        return [{"client_id": o["id"]} for o in self.rows.values() if o["status"] not in TERMINAL]
+        return [{**deepcopy(o), "client_id": o["id"]}
+                for o in self.rows.values() if o["status"] not in TERMINAL]
 
     async def order_status(self, client_id):
         return deepcopy(self.rows.get(client_id))
@@ -151,6 +152,14 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
 
     def quote(self, side):
         return next(o for o in self.maker.live("quote") if o["side"] == side)
+
+    def seed_missing_quote(self, **changes):
+        order = {"id": "249670502102335", "kind": "quote", "side": 1,
+                 "quantity": ".0034", "price": "3000.45", "reduce_only": False,
+                 "filled": "0", "status": "PENDING", **changes}
+        self.maker.state["orders"].append(order)
+        self.maker.save()
+        return order
 
     async def test_places_two_best_quotes_with_equal_quantities(self):
         await self.start()
@@ -392,16 +401,170 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["orders"][0]["submission"]["tx_hash"], "fake-hash")
         self.assertEqual(state["orders"][0]["status"], "PENDING")
 
-    async def test_restart_cancels_old_quotes_and_recovers_inventory(self):
+    async def test_restart_keeps_existing_exit_and_recovers_inventory(self):
         await self.start()
         bid = self.quote(1)
+        ask_id = self.quote(-1)["id"]
         self.exchange.fill(bid["id"])
         restarted = MarketMaker(self.exchange, self.path, round_up=True)
         await restarted.initialize()
         self.assertEqual(D(restarted.state["expected_size"]), self.exchange.current["size"])
         await restarted.step()
-        self.assertTrue(restarted.live("quote")[0]["reduce_only"])
+        self.assertEqual(restarted.live("quote")[0]["id"], ask_id)
         self.assertEqual(restarted.live("quote")[0]["side"], -1)
+        self.assertFalse(self.exchange.canceled)
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_startup_preserves_both_existing_quotes_without_canceling(self):
+        await self.start()
+        before = [o["id"] for o in self.maker.live("quote")]
+        restarted = MarketMaker(self.exchange, self.path)
+        with patch.object(self.exchange, "set_leverage", new_callable=AsyncMock) as leverage:
+            await restarted.initialize()
+        self.assertEqual([o["id"] for o in restarted.live("quote")], before)
+        self.assertFalse(self.exchange.canceled)
+        self.assertEqual(len(self.exchange.sent), 2)
+        leverage.assert_not_called()
+
+    async def test_legacy_phantom_quote_is_archived_when_grace_elapsed_and_api_flat(self):
+        order = self.seed_missing_quote()
+        self.maker.state["phase"] = "stopping"
+        self.maker.legacy_recovery_deadline = 0
+        await self.maker.initialize()
+        self.assertEqual(order["status"], "ABSENT")
+        self.assertFalse(self.exchange.canceled)
+        self.assertFalse(self.exchange.sent)
+        saved = json.loads(self.path.read_text(encoding="utf8"))
+        self.assertEqual(saved["orders"][0]["status"], "ABSENT")
+        audit = self.path.with_suffix(".orders.jsonl").read_text(encoding="utf8")
+        self.assertIn("order_reconciled_absent", audit)
+        self.assertIn("249670502102335", audit)
+        await self.maker.step()
+        await self.maker.step()
+        self.assertEqual(len(self.maker.live("quote")), 2)
+
+    async def test_expired_missing_quote_with_stored_expiry_needs_no_legacy_wait(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        with patch("main.asyncio.wait_for", new_callable=AsyncMock) as wait:
+            await self.maker.initialize()
+        wait.assert_not_called()
+        self.assertEqual(order["status"], "ABSENT")
+
+    async def test_fresh_missing_quote_waits_and_stop_does_not_discard_it(self):
+        import time
+        order = self.seed_missing_quote(expires_at_ms=int(time.time() * 1000) + 60000)
+
+        async def interrupt_wait(coroutine, timeout):
+            self.assertGreater(timeout, 60)
+            self.maker.stop.set()
+            return await coroutine
+
+        with patch("main.asyncio.wait_for", side_effect=interrupt_wait):
+            await self.maker.run()
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.maker.initialized)
+
+    async def test_legacy_missing_quote_gets_one_minute_grace(self):
+        order = self.seed_missing_quote()
+
+        async def interrupt_wait(coroutine, timeout):
+            self.assertGreater(timeout, 60)
+            self.maker.stop.set()
+            return await coroutine
+
+        with patch("main.asyncio.wait_for", side_effect=interrupt_wait):
+            await self.maker.initialize()
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_missing_reference_with_position_is_not_discarded(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        self.exchange.current = {"size": D(".0034"), "entry": D("3000.45")}
+        with self.assertRaises(ReadModelLag):
+            await self.maker.initialize()
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_missing_reference_with_reconciled_position_is_not_discarded(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        self.maker.state["expected_size"] = ".0034"
+        self.exchange.current = {"size": D(".0034"), "entry": D("3000.45")}
+        with self.assertRaises(UncertainOrder):
+            await self.maker.initialize()
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_missing_reference_with_real_open_order_is_not_discarded(self):
+        await self.start()
+        order = self.seed_missing_quote(expires_at_ms=1)
+        with self.assertRaises(UncertainOrder):
+            await self.maker.initialize()
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_api_failure_never_means_missing_order_can_be_discarded(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        for method in ("active_orders", "order_status", "position"):
+            with self.subTest(method=method):
+                with patch.object(self.exchange, method, side_effect=RuntimeError("offline")):
+                    with self.assertRaisesRegex(RuntimeError, "offline"):
+                        await self.maker.initialize()
+                self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_late_appearing_order_is_kept_after_grace(self):
+        order = self.seed_missing_quote()
+
+        async def make_order_visible(coroutine, timeout):
+            coroutine.close()
+            self.exchange.rows[order["id"]] = {**deepcopy(order), "status": "OPEN"}
+            raise TimeoutError()
+
+        with patch("main.asyncio.wait_for", side_effect=make_order_visible):
+            await self.maker.initialize()
+        self.assertEqual(order["status"], "OPEN")
+        self.assertFalse(self.exchange.canceled)
+        self.assertFalse(self.exchange.sent)
+
+    async def test_second_snapshot_failure_keeps_missing_reference(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        with patch.object(self.exchange, "order_status", side_effect=[None, RuntimeError("offline")]):
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                await self.maker.initialize()
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_position_appearing_in_second_snapshot_prevents_retirement(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        with patch.object(self.exchange, "position", side_effect=[
+                {"size": D(0), "entry": D(0)},
+                {"size": D(".0034"), "entry": D("3000.45")} ]):
+            with self.assertRaises(ReadModelLag):
+                await self.maker.initialize()
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_missing_market_close_is_never_retired_as_expired_quote(self):
+        order = self.seed_missing_quote(kind="close", expires_at_ms=1, reduce_only=True)
+        with self.assertRaises(UncertainOrder):
+            await self.maker.initialize()
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_quote_expiry_is_persisted_before_submission(self):
+        await self.maker.initialize()
+        original = self.exchange.place
+
+        async def verify_expiry(order):
+            saved = json.loads(self.path.read_text(encoding="utf8"))
+            recorded = next(o for o in saved["orders"] if o["id"] == order["id"])
+            self.assertEqual(recorded["expires_at_ms"], order["expires_at_ms"])
+            return await original(order)
+
+        with patch.object(self.exchange, "place", side_effect=verify_expiry):
+            await self.maker.step()
 
     async def test_rejects_other_strategy_journal(self):
         self.path.write_text(json.dumps({"strategy": "funding", "identity": self.exchange.identity}))
@@ -515,6 +678,13 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent["is_ask"])
         self.assertTrue(sent["reduce_only"])
         adapter.confirm.assert_awaited_once_with("123", terminal=True)
+
+    async def test_quote_uses_expiry_already_persisted_in_journal(self):
+        adapter = self.adapter()
+        order = self.order(expires_at_ms=1790000060000)
+        await adapter.place(order)
+        self.assertEqual(adapter.signer.create_order.call_args.kwargs["order_expiry"],
+                         order["expires_at_ms"])
 
     async def test_timeout_does_not_resend_order(self):
         adapter = self.adapter()

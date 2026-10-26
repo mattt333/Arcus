@@ -8,9 +8,10 @@ import aiohttp
 
 TIMEOUT = 10
 ORDER_TIMEOUT = 10
+QUOTE_TTL_SECONDS = 60
 MARKET = "XAU-USD"
 MARGIN_MULTIPLIER = D("1.5")
-TERMINAL = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+TERMINAL = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "ABSENT"}
 
 
 class ApiError(RuntimeError):
@@ -236,9 +237,10 @@ class Lighter:
             price=self.units(order["price"], self.market["tick"]),
             is_ask=order["side"] == -1, reduce_only=order["reduce_only"])
         if kind == "quote":
+            order.setdefault("expires_at_ms", int(time.time() * 1000) + QUOTE_TTL_SECONDS * 1000)
             args.update(order_type=client.ORDER_TYPE_LIMIT,
                 time_in_force=client.ORDER_TIME_IN_FORCE_POST_ONLY,
-                order_expiry=int(time.time() * 1000) + 60_000)
+                order_expiry=order["expires_at_ms"])
         elif kind == "close":
             args.update(order_type=client.ORDER_TYPE_MARKET,
                 time_in_force=client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
