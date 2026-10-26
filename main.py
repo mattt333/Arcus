@@ -10,12 +10,14 @@ from contextlib import contextmanager
 from decimal import Decimal as D, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
-from exchanges import Http, Lighter, OrderRejected, QUOTE_TTL_SECONDS, TERMINAL, UncertainOrder, decimal
+from exchanges import ApiError, Http, Lighter, OrderRejected, QUOTE_TTL_SECONDS, TERMINAL, UncertainOrder, decimal
 
 ORDER_USD = D("10")
 MIN_LIQUIDITY_USD = D("100")
 STOP_DISTANCE = D("1")
 POLL_SECONDS = 0.5
+STARTUP_RETRY_SECONDS = 5
+MAX_STARTUP_RETRY_SECONDS = 60
 CLOSE_SLIPPAGE = D("0.02")
 RECOVERY_GRACE_SECONDS = 5
 # Old versions without a persisted expiry submitted 60-second quotes.
@@ -157,8 +159,11 @@ class MarketMaker:
 
     async def position(self):
         position = await self.exchange.position()
-        if position["size"] != D(self.state["expected_size"]):
-            raise ReadModelLag("Position et exécutions non réconciliées ; aucune nouvelle cotation")
+        expected = D(self.state["expected_size"])
+        if position["size"] != expected:
+            raise ReadModelLag(
+                f"Position et exécutions non réconciliées : Lighter={position['size']} XAU, "
+                f"journal={expected} XAU ; aucune nouvelle cotation")
         return position
 
     async def cancel(self, order, reason):
@@ -421,8 +426,27 @@ class MarketMaker:
             await asyncio.sleep(max(POLL_SECONDS, self.exchange.retry_after))
         raise RuntimeError("URGENT : vérifier XAU sur Lighter ; fermeture non confirmée")
 
+    async def wait_for_retry(self, delay):
+        try:
+            await asyncio.wait_for(self.stop.wait(), delay)
+        except TimeoutError:
+            pass
+
     async def run(self):
-        await self.initialize()
+        retry_delay = STARTUP_RETRY_SECONDS
+        while not self.stop.is_set():
+            try:
+                await self.initialize()
+                break
+            except (ApiError, ReadModelLag, UncertainOrder) as exc:
+                # Garder le même client et son délai de quota entre tentatives.
+                # Les fills déjà confirmés sont conservés ; aucun inventaire
+                # n'est adopté sans preuve d'exécution dans le journal.
+                delay = max(retry_delay, self.exchange.retry_after)
+                log.warning("Démarrage suspendu : %s ; nouvelle vérification dans %.1f s ; "
+                            "aucune nouvelle cotation, stop non surveillé avant réconciliation", exc, delay)
+                await self.wait_for_retry(delay)
+                retry_delay = min(retry_delay * 2, MAX_STARTUP_RETRY_SECONDS)
         if not self.initialized:
             return
         try:
@@ -436,10 +460,7 @@ class MarketMaker:
                     except Exception:
                         log.exception("URGENT : annulation non confirmée ; expiration prévue des quotes "
                                       "au plus tard %s s après leur création", QUOTE_TTL_SECONDS)
-                try:
-                    await asyncio.wait_for(self.stop.wait(), max(POLL_SECONDS, self.exchange.retry_after))
-                except TimeoutError:
-                    pass
+                await self.wait_for_retry(max(POLL_SECONDS, self.exchange.retry_after))
         finally:
             if self.initialized:
                 await self.shutdown()

@@ -316,6 +316,119 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.maker.step.assert_awaited_once()
         self.maker.cancel_quotes.assert_awaited_once()
 
+    async def test_startup_429_waits_for_quota_then_initializes_in_same_process(self):
+        self.exchange.load_market = AsyncMock(side_effect=[RateLimited("429"), market()])
+        self.exchange.retry_after = 35
+        self.maker.step = AsyncMock(side_effect=self.maker.stop.set)
+        self.maker.shutdown = AsyncMock()
+
+        async def retry(delay):
+            if not self.maker.initialized:
+                self.assertEqual(delay, 35)
+                self.assertFalse(self.exchange.sent)
+                self.assertFalse(self.exchange.canceled)
+                self.exchange.retry_after = 0
+
+        with patch.object(self.maker, "wait_for_retry", side_effect=retry), self.assertLogs("xau-mm", level="WARNING") as logs:
+            await self.maker.run()
+        self.assertTrue(self.maker.initialized)
+        self.assertEqual(self.exchange.load_market.await_count, 2)
+        self.assertIn("Démarrage suspendu", logs.output[0])
+        self.maker.step.assert_awaited_once()
+
+    async def test_startup_errors_back_off_without_entering_trading_loop(self):
+        self.maker.initialize = AsyncMock(side_effect=[
+            RateLimited("429"), ApiError("offline"), ReadModelLag("lag"),
+            UncertainOrder("invisible"), RateLimited("429"), RateLimited("429")])
+        self.maker.step = AsyncMock()
+        self.maker.shutdown = AsyncMock()
+        delays = []
+
+        async def retry(delay):
+            delays.append(delay)
+            if len(delays) == 6:
+                self.maker.stop.set()
+
+        with patch.object(self.maker, "wait_for_retry", side_effect=retry), self.assertLogs("xau-mm"):
+            await self.maker.run()
+        self.assertEqual(delays, [5, 10, 20, 40, 60, 60])
+        self.assertFalse(self.maker.initialized)
+        self.maker.step.assert_not_awaited()
+        self.maker.shutdown.assert_not_awaited()
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_startup_persistent_position_mismatch_preserves_journal(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        self.exchange.current = {"size": D(".0034"), "entry": D("3000.45")}
+        before = deepcopy(self.maker.state)
+        self.maker.step = AsyncMock()
+        self.maker.shutdown = AsyncMock()
+
+        async def stop_retry(delay):
+            self.assertEqual(delay, 5)
+            self.maker.stop.set()
+
+        with patch.object(self.maker, "wait_for_retry", side_effect=stop_retry), self.assertLogs("xau-mm", level="WARNING") as logs:
+            await self.maker.run()
+        self.assertIn("Lighter=0.0034 XAU, journal=0 XAU", logs.output[0])
+        self.assertEqual(self.maker.state, before)
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf8")), before)
+        self.assertEqual(order["status"], "PENDING")
+        self.maker.step.assert_not_awaited()
+        self.maker.shutdown.assert_not_awaited()
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_startup_position_lag_recovers_without_counting_fill_twice(self):
+        await self.start()
+        self.exchange.fill(self.quote(1)["id"])
+        current = deepcopy(self.exchange.current)
+        restarted = MarketMaker(self.exchange, self.path)
+        self.exchange.position = AsyncMock(side_effect=[
+            {"size": D(0), "entry": D(0)}, current, current])
+        restarted.step = AsyncMock(side_effect=restarted.stop.set)
+        restarted.shutdown = AsyncMock()
+        with patch.object(restarted, "wait_for_retry", new_callable=AsyncMock), self.assertLogs("xau-mm"):
+            await restarted.run()
+        self.assertTrue(restarted.initialized)
+        self.assertEqual(D(restarted.state["expected_size"]), current["size"])
+        self.assertFalse(self.exchange.canceled)
+        self.assertEqual(len(self.exchange.sent), 2)
+        restarted.step.assert_awaited_once()
+
+    async def test_stop_interrupts_startup_backoff_without_shutdown_orders(self):
+        self.exchange.load_market = AsyncMock(side_effect=RateLimited("429"))
+        self.maker.shutdown = AsyncMock()
+
+        async def stop_wait(event, delay):
+            self.assertEqual(delay, 5)
+            self.maker.stop.set()
+            await event
+
+        with patch("main.asyncio.wait_for", side_effect=stop_wait), self.assertLogs("xau-mm"):
+            await self.maker.run()
+        self.exchange.load_market.assert_awaited_once()
+        self.maker.shutdown.assert_not_awaited()
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_startup_configuration_errors_are_not_retried(self):
+        self.exchange.load_market = AsyncMock(side_effect=ValueError("Contrat incompatible"))
+        with patch.object(self.maker, "wait_for_retry", new_callable=AsyncMock) as wait:
+            with self.assertRaisesRegex(ValueError, "Contrat incompatible"):
+                await self.maker.run()
+        wait.assert_not_awaited()
+        self.assertFalse(self.maker.initialized)
+
+    async def test_stop_before_startup_does_not_read_or_send(self):
+        self.exchange.load_market = AsyncMock()
+        self.maker.stop.set()
+        await self.maker.run()
+        self.exchange.load_market.assert_not_awaited()
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.exchange.canceled)
+
     async def test_server_order_index_is_persisted_for_cancellation(self):
         await self.start()
         order = self.quote(1)

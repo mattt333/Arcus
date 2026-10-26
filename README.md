@@ -144,6 +144,20 @@ réellement présents sont conservés, y compris l'ordre opposé à une position
 Le suivi habituel du marché reprend ensuite ; il peut annuler une quote
 dont le prix ou la liquidité ne respecte plus les règles de la stratégie.
 
+Un 429, une erreur de lecture, un ordre incertain ou un écart de position
+pendant l'initialisation suspend le démarrage dans le même processus, au
+lieu de provoquer des redémarrages systemd. Les vérifications sont retentées
+après **5, 10, 20, 40 puis 60 secondes**, ou après le délai REST s'il est plus
+long. Un arrêt demandé interrompt cette attente. Les autres erreurs de
+configuration ou de compte restent bloquantes et provoquent un échec.
+En cas d'écart, le message indique la position signée sur Lighter et celle
+attendue dans le journal, en XAU. Une nouvelle lecture peut résoudre un
+retard de publication de l'API ; un écart persistant nécessite de vérifier
+le compte et l'historique des exécutions. L'inventaire attendu n'est jamais
+remplacé automatiquement par la position observée. Pendant cette attente,
+aucune nouvelle cotation n'est envoyée et le stop n'est pas surveillé.
+Conserver le journal d'état pour permettre cette réconciliation.
+
 Un refus explicite du SDK ou de `sendTx` est enregistré comme `REJECTED`,
 avec son message et son code : il ne provoque pas de recherche ou d'annulation
 d'un ordre inexistant. Une réponse acceptée conserve le hash de transaction ;
