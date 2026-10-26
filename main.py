@@ -60,6 +60,10 @@ class QuoteUnavailable(ValueError):
     pass
 
 
+class QuoteRetryPending(RuntimeError):
+    pass
+
+
 class ReadModelLag(RuntimeError):
     def __init__(self, message, observed=None):
         super().__init__(message)
@@ -77,6 +81,21 @@ def quote_quantity(market, bid, ask, round_up=True):
             or quantity * bid < decimal(market["min_quote_amount"])
             or quantity * ask > decimal(market["order_quote_limit"])):
         raise QuoteUnavailable("10 $ incompatibles avec les minimums et le pas de quantité XAU")
+    return quantity
+
+
+def reduce_only_quantity(market, size, price):
+    """Respecter les minimums ; reduce-only borne les fills à la position.
+
+    https://docs.lighter.xyz/trading/order-types-and-matching
+    """
+    price = decimal(price, positive=True)
+    step = decimal(market["step"], positive=True)
+    minimum = max(decimal(size, positive=True), decimal(market["min_base_amount"]),
+                  decimal(market["min_quote_amount"]) / price)
+    quantity = (minimum / step).to_integral_value(rounding=ROUND_CEILING) * step
+    if quantity * price > decimal(market["order_quote_limit"]):
+        raise QuoteUnavailable("Sortie reduce-only au-delà de la limite de notionnel XAU")
     return quantity
 
 
@@ -185,6 +204,9 @@ class MarketMaker:
             raise UncertainOrder("; ".join(failures))
 
     async def place(self, kind, side, quantity, price, reduce_only=False):
+        retry = self.state.get("quote_retry", {}).get(str(side), {}) if kind == "quote" else {}
+        if time.time() < retry.get("retry_at", 0):
+            raise QuoteRetryPending("Nouvelle tentative de quote différée après refus explicite")
         order = {"id": str(uuid.uuid4().int % (2 ** 48 - 1) + 1),
                  "kind": kind, "side": side, "quantity": str(quantity),
                  "price": str(price), "reduce_only": reduce_only,
@@ -197,12 +219,20 @@ class MarketMaker:
         try:
             row = await self.exchange.place(order)
         except OrderRejected as exc:
+            if kind == "quote":
+                delay = min(retry.get("delay", STARTUP_RETRY_SECONDS / 2) * 2, MAX_STARTUP_RETRY_SECONDS)
+                self.state.setdefault("quote_retry", {})[str(side)] = {
+                    "retry_at": time.time() + delay, "delay": delay, "reason": str(exc)}
+                log.warning("Quote refusée : quantité=%s XAU, prix=%s, reduce_only=%s ; "
+                            "nouvelle tentative de ce côté dans %.1f s", quantity, price, reduce_only, delay)
             self.update(order, {"status": "REJECTED", "filled": "0"})
             self.audit("order_rejected", id=order["id"], reason=str(exc))
             raise
         finally:
             # Conserver aussi le résultat d'envoi si la confirmation échoue.
             self.save()
+        if kind == "quote":
+            self.state.get("quote_retry", {}).pop(str(side), None)
         self.update(order, row)
         return order
 
@@ -326,6 +356,7 @@ class MarketMaker:
         if self.state["orders"]:
             self.audit("cycle_closed", orders=self.state["orders"])
         self.state.pop("exit_price", None)
+        self.state.pop("quote_retry", None)
         self.state.update(orders=[], cycle_quantity=None, cycle_filled=False, phase="quoting")
         self.save()
 
@@ -345,7 +376,8 @@ class MarketMaker:
         tick = self.market["tick"]
         price = (best * (1 + side * CLOSE_SLIPPAGE) / tick).to_integral_value(
             rounding=ROUND_CEILING if side == 1 else ROUND_FLOOR) * tick
-        await self.place("close", side, abs(position["size"]), price, reduce_only=True)
+        quantity = reduce_only_quantity(self.market, abs(position["size"]), min(best, price))
+        await self.place("close", side, quantity, price, reduce_only=True)
         # Un IOC peut être partiel : la phase stopping reste durable jusqu'à zéro.
 
     async def step(self):
@@ -393,7 +425,7 @@ class MarketMaker:
                 price = D(order["price"])
                 remaining = D(order["quantity"]) - D(order["filled"])
                 # Garder l'ordre et son prix tant qu'il ne peut pas inverser la position.
-                if remaining > abs(size):
+                if remaining > abs(size) and not order["reduce_only"]:
                     await self.cancel(order, "redimensionnement après fill partiel")
                     self.state["exit_price"] = str(price)
                     self.save()
@@ -405,8 +437,8 @@ class MarketMaker:
             if liquidity(book, -entry_side, price) < MIN_LIQUIDITY_USD:
                 price = book[side_name(-entry_side)][0][0]
             if liquidity(book, -entry_side, price) >= MIN_LIQUIDITY_USD:
-                # Les sorties peuvent être inférieures à 10 $ après un fill partiel.
-                await self.place("quote", -entry_side, abs(size), price, reduce_only=True)
+                quantity = reduce_only_quantity(self.market, abs(size), price)
+                await self.place("quote", -entry_side, quantity, price, reduce_only=True)
                 self.state.pop("exit_price", None)
                 self.save()
             return
@@ -501,6 +533,10 @@ class MarketMaker:
             while not self.stop.is_set():
                 try:
                     await self.step()
+                except QuoteRetryPending:
+                    # Le prochain cycle relit position/carnet et surveille le
+                    # stop ; seule la soumission des quotes refusées attend.
+                    pass
                 except Exception:
                     log.exception("Cycle suspendu ; tentative d'annulation des quotes")
                     try:

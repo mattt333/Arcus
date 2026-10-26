@@ -315,6 +315,11 @@ class Lighter:
                 order_expiry=client.DEFAULT_IOC_EXPIRY)
         else:
             raise ValueError("Type d'ordre inconnu")
+        context = (f"quantité={order['quantity']} XAU, prix={order['price']}, "
+                   f"notionnel={decimal(order['quantity']) * decimal(order['price'])}, "
+                   f"base_amount={args['base_amount']}, price={args['price']}, "
+                   f"reduce_only={order['reduce_only']}, "
+                   f"min_base={self.market['min_base_amount']}, min_quote={self.market['min_quote_amount']}")
         try:
             async with self.lock, asyncio.timeout(TIMEOUT):
                 transaction, response, error = await client.create_order(**args)
@@ -325,12 +330,12 @@ class Lighter:
             if response is not None and response.code != 200:
                 reason = f"code={response.code}, message={getattr(response, 'message', None)}"
                 order["submission"] = {"state": "rejected", "reason": reason}
-                raise OrderRejected(f"Ordre {order['id']} refusé par Lighter : {reason}")
+                raise OrderRejected(f"Ordre {order['id']} refusé par Lighter : {reason} ; {context}")
             if error and transaction is None and response is None:
                 # Le SDK renvoie ce triplet si la signature échoue ou si l'API
                 # répond BadRequest. Il ne faut pas attendre un ordre inexistant.
                 order["submission"] = {"state": "rejected", "reason": str(error)}
-                raise OrderRejected(f"Ordre {order['id']} refusé par le SDK/Lighter : {error}")
+                raise OrderRejected(f"Ordre {order['id']} refusé par le SDK/Lighter : {error} ; {context}")
             if response is not None and response.code == 200:
                 order["submission"] = {"state": "accepted",
                     "tx_hash": getattr(response, "tx_hash", None)}

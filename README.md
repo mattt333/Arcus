@@ -22,7 +22,9 @@ ont été retirés.
 - Après un fill complet, conserver l'ordre opposé à son prix initial tant
   que son tick reste admissible, même si le meilleur prix se déplace.
   Après un fill partiel, si cet ordre peut dépasser l'inventaire restant,
-  le recréer au même prix pour la quantité restante, en **reduce-only**.
+  le recréer au même prix en **reduce-only**, pour la quantité restante
+  arrondie au minimum accepté par le marché. Un ordre déjà reduce-only
+  peut être conservé même si son reliquat dépasse la position.
 - Le seuil de liquidité s'applique également à la sortie. Si son tick
   devient inadmissible, annuler l'ordre ; le replacer au meilleur prix
   admissible dès que possible. Le stop continue à être surveillé.
@@ -60,8 +62,16 @@ les entrées : avec le minimum actuel de 10 $ et deux prix différents pour
 une même quantité, les deux quotes ne peuvent pas toutes deux être exactement
 à 10 $. Si le service définit déjà cette variable à `0`, la passer à `1`.
 
-Les sorties reduce-only utilisent la quantité réelle restante, qui peut
-être inférieure au minimum d'une nouvelle entrée après un fill partiel.
+Les sorties reduce-only respectent également les minimums de quantité et
+de notionnel du marché. Après un fill partiel, la quantité envoyée est le
+maximum entre la position restante, `min_base_amount` et
+`min_quote_amount / prix`, arrondi au pas supérieur. Par exemple, pour
+0,0010 XAU à fermer autour de 4020 $, le bot envoie 0,0025 XAU **reduce-only**.
+[Lighter limite les exécutions à la position et annule le surplus](https://docs.lighter.xyz/trading/order-types-and-matching) :
+cette quantité supérieure ne peut pas retourner la position. Le journal
+conserve la quantité effectivement envoyée et seuls les fills confirmés
+modifient l'inventaire attendu. Cette règle couvre aussi les MARKET / IOC
+du stop, avec un calcul tenant compte du prix limite de slippage.
 
 ## Installation et lancement
 
@@ -176,6 +186,15 @@ avec son message et son code : il ne provoque pas de recherche ou d'annulation
 d'un ordre inexistant. Une réponse acceptée conserve le hash de transaction ;
 une exception de transport reste incertaine et fait l'objet d'une réconciliation.
 Le résultat d'envoi est conservé dans le champ `submission` du journal.
+
+Après un refus explicite d'une quote, les nouvelles tentatives sur le même
+côté sont espacées de **5, 10, 20, 40 puis 60 secondes**. Ce délai, conservé
+dans `quote_retry`, est réinitialisé après acceptation ou fin du cycle.
+Le carnet, les fills et la position continuent d'être relus ; le stop reste
+surveillé et ses ordres MARKET ne sont pas différés par cette attente.
+Les messages de refus indiquent quantité, prix, notionnel, entiers transmis
+au SDK, option reduce-only et minimums du marché pour diagnostiquer un
+éventuel nouveau refus `21706`.
 
 Un identifiant enregistré avant l'envoi peut rester `PENDING` sans qu'aucun
 ordre ait jamais été créé sur Lighter. Si une quote est introuvable dans

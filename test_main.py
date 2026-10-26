@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from exchanges import ApiError, Http, Lighter, OrderRejected, RateLimited, TERMINAL, UncertainOrder
-from main import MarketMaker, QuoteUnavailable, ReadModelLag, quote_quantity, state_lock, stop_hit
+from main import (MarketMaker, QuoteRetryPending, QuoteUnavailable, ReadModelLag,
+                  quote_quantity, reduce_only_quantity, state_lock, stop_hit)
 
 
 def market():
@@ -56,9 +57,13 @@ class FakeLighter:
 
     async def place(self, order):
         self.sent.append(deepcopy(order))
+        if (D(order["quantity"]) < D(self.market["min_base_amount"])
+                or D(order["quantity"]) * D(order["price"]) < D(self.market["min_quote_amount"])):
+            raise OrderRejected("code=21706 invalid order base or quote amount")
         self.rows[order["id"]] = {**deepcopy(order), "status": "OPEN"}
         if order["kind"] == "close":
-            self.fill(order["id"], D(order["quantity"]) * self.close_fraction)
+            executable = min(D(order["quantity"]), abs(self.current["size"]))
+            self.fill(order["id"], executable * self.close_fraction)
             if self.rows[order["id"]]["status"] != "FILLED":
                 self.rows[order["id"]]["status"] = "CANCELED"
         return await self.order_status(order["id"])
@@ -131,6 +136,22 @@ class SizingTests(unittest.TestCase):
             m[key] = value
             with self.assertRaises(QuoteUnavailable):
                 quote_quantity(m, D(3000), D(3001), round_up=True)
+
+    def test_small_reduce_only_exit_meets_notional_minimum(self):
+        self.assertEqual(reduce_only_quantity(market(), D(".0001"), D(4020)), D(".0025"))
+        self.assertEqual(reduce_only_quantity(market(), D(".0024"), D(4020)), D(".0025"))
+
+    def test_reduce_only_exit_meets_base_minimum_and_rounds_to_step(self):
+        self.assertEqual(reduce_only_quantity(market(), D(".0001"), D(10000)), D(".0020"))
+        self.assertEqual(reduce_only_quantity(market(), D(".0020"), D(4000)), D(".0025"))
+        self.assertEqual(reduce_only_quantity(market(), D(".0040"), D(4000)), D(".0040"))
+
+    def test_reduce_only_exit_rejects_invalid_size_and_quote_limit(self):
+        for size in (D(0), D(-1)):
+            with self.assertRaises(ValueError):
+                reduce_only_quantity(market(), size, D(4000))
+        with self.assertRaises(QuoteUnavailable):
+            reduce_only_quantity({**market(), "order_quote_limit": "9"}, D(".0001"), D(4000))
 
     def test_stop_is_one_price_unit_in_both_directions(self):
         long = {"size": D(".0034"), "entry": D("3000.45")}
@@ -484,10 +505,94 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(bid["id"], self.exchange.canceled)
         self.assertIn(ask["id"], self.exchange.canceled)
         exit_order = self.quote(-1)
-        self.assertEqual(D(exit_order["quantity"]), D(".0010"))
+        self.assertEqual(D(exit_order["quantity"]), reduce_only_quantity(market(), D(".0010"), D(ask["price"])))
         self.assertEqual(exit_order["price"], ask["price"])
         self.assertTrue(exit_order["reduce_only"])
         self.assertFalse(any(o["side"] == 1 for o in self.maker.live()))
+
+    async def test_small_reduce_only_exit_is_kept_and_cannot_reverse_position(self):
+        await self.start()
+        self.exchange.fill(self.quote(1)["id"], D(".0010"))
+        await self.maker.step()
+        await self.maker.step()
+        exit_order = deepcopy(self.quote(-1))
+        self.assertEqual(D(exit_order["quantity"]), D(".0034"))
+        before = len(self.exchange.sent)
+        for _ in range(4):
+            await self.maker.step()
+        self.assertEqual(self.quote(-1)["id"], exit_order["id"])
+        self.assertEqual(len(self.exchange.sent), before)
+        self.assertNotIn(exit_order["id"], self.exchange.canceled)
+        self.exchange.fill(exit_order["id"])
+        self.assertEqual(self.exchange.current["size"], 0)
+        await self.maker.step()
+        self.assertEqual(D(self.maker.state["expected_size"]), 0)
+        self.assertFalse(self.maker.live())
+
+    async def test_small_short_exit_respects_minimum_without_increasing_inventory(self):
+        await self.start()
+        self.exchange.fill(self.quote(-1)["id"], D(".0010"))
+        await self.maker.step()
+        await self.maker.step()
+        exit_order = self.quote(1)
+        self.assertEqual(D(exit_order["quantity"]), D(".0034"))
+        self.assertTrue(exit_order["reduce_only"])
+        self.exchange.fill(exit_order["id"])
+        await self.maker.refresh()
+        self.assertEqual(self.exchange.current["size"], 0)
+        self.assertEqual(D(self.maker.state["expected_size"]), 0)
+
+    async def test_rejected_exit_waits_between_retries_while_stop_remains_active(self):
+        await self.start()
+        self.exchange.fill(self.quote(1)["id"], D(".0010"))
+        await self.maker.step()
+        original = self.exchange.place
+        with patch.object(self.exchange, "place", side_effect=OrderRejected("code=21706")) as send:
+            with self.assertRaises(OrderRejected):
+                await self.maker.step()
+            for _ in range(3):
+                with self.assertRaises(QuoteRetryPending):
+                    await self.maker.step()
+            send.assert_awaited_once()
+            self.assertEqual(D(self.maker.state["expected_size"]), D(".0010"))
+        self.exchange.place = original
+        self.exchange.depth = book("2999.45", "2999.55")
+        await self.maker.step()
+        close = self.exchange.sent[-1]
+        self.assertEqual(close["kind"], "close")
+        self.assertTrue(close["reduce_only"])
+        self.assertGreaterEqual(D(close["quantity"]) * D(close["price"]), 10)
+        self.assertEqual(self.exchange.current["size"], 0)
+
+    async def test_repeated_quote_rejections_back_off_and_success_clears_delay(self):
+        await self.maker.initialize()
+        now = 1000
+        with patch("main.time.time", side_effect=lambda: now):
+            for delay in (5, 10, 20, 40, 60, 60):
+                with patch.object(self.exchange, "place", side_effect=OrderRejected("21706")):
+                    with self.assertRaises(OrderRejected):
+                        await self.maker.place("quote", -1, D(".0034"), D("3000.55"), reduce_only=True)
+                self.assertEqual(self.maker.state["quote_retry"]["-1"]["retry_at"], now + delay)
+                with self.assertRaises(QuoteRetryPending):
+                    await self.maker.place("quote", -1, D(".0034"), D("3000.55"), reduce_only=True)
+                now += delay
+            await self.maker.place("quote", -1, D(".0034"), D("3000.55"), reduce_only=True)
+        self.assertNotIn("-1", self.maker.state["quote_retry"])
+
+    async def test_deferred_quote_does_not_trigger_cycle_error_cancellations(self):
+        self.maker.initialized = True
+        self.maker.initialize = AsyncMock()
+        self.maker.step = AsyncMock(side_effect=QuoteRetryPending("attente"))
+        self.maker.cancel_quotes = AsyncMock()
+        self.maker.shutdown = AsyncMock()
+
+        async def stop_retry(delay):
+            self.maker.stop.set()
+
+        with patch.object(self.maker, "wait_for_retry", side_effect=stop_retry):
+            await self.maker.run()
+        self.maker.step.assert_awaited_once()
+        self.maker.cancel_quotes.assert_not_awaited()
 
     async def test_liquidity_below_100_cancels_quote(self):
         await self.start()
@@ -560,7 +665,8 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         await self.maker.step()
         self.exchange.close_fraction = D(1)
         await self.maker.step()
-        self.assertEqual(D(self.exchange.sent[-1]["quantity"]), quantity / 2)
+        self.assertEqual(D(self.exchange.sent[-1]["quantity"]),
+                         reduce_only_quantity(market(), quantity / 2, D(self.exchange.sent[-1]["price"])))
         self.assertEqual(self.exchange.current["size"], 0)
 
     async def test_both_quotes_resume_only_after_flat(self):
@@ -635,7 +741,10 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.maker.live())
         restarted = MarketMaker(self.exchange, self.path)
         await restarted.initialize()
-        await restarted.step()
+        with self.assertRaises(QuoteRetryPending):
+            await restarted.step()
+        with patch("main.time.time", return_value=time.time() + 61):
+            await restarted.step()
         self.assertEqual(len(restarted.live("quote")), 2)
         self.assertFalse(self.exchange.canceled)
 
@@ -1108,6 +1217,19 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(OrderRejected, "21111.*insufficient margin"):
             await adapter.place(self.order())
         adapter.confirm.assert_not_called()
+
+    async def test_21706_reports_submitted_amount_price_and_market_minimums(self):
+        adapter = self.adapter()
+        adapter.signer.create_order.return_value = (None, None, "code=21706 invalid order base or quote amount")
+        with self.assertRaises(OrderRejected) as failure:
+            await adapter.place(self.order(quantity=".0010", reduce_only=True))
+        message = str(failure.exception)
+        self.assertIn("base_amount=10", message)
+        self.assertIn("price=300045", message)
+        self.assertIn("reduce_only=True", message)
+        self.assertIn("min_base=0.0020", message)
+        self.assertIn("min_quote=10", message)
+        adapter.confirm.assert_not_awaited()
 
     async def test_unknown_timeout_stays_uncertain_with_original_context(self):
         adapter = self.adapter()
