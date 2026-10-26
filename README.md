@@ -116,11 +116,16 @@ enregistrées dans son journal.
 - Maximum de trois paires distinctes ; conserver une paire ouverte jusqu'à
   ce qu'un critère de sortie soit atteint.
 
-Le bot choisit le levier entier maximal déduit des exigences de marge du
-marché, sur chaque plateforme, en marge isolée. La marge initiale est donc
-approximativement le notionnel divisé par ce levier. À 20×, une jambe de
-200 $ demande environ 10 $ de marge initiale, soit 30 $ par plateforme
-pour trois paires ; à 5×, il faut environ 120 $. Prévoir en plus les frais,
+Le bot vise 50 % de marge initiale supplémentaire par rapport au minimum
+du marché, sur chaque plateforme, en marge isolée. Il choisit le levier
+`max(1, floor(1 / (fraction_de_marge_minimale * 1.5)))`.
+L'arrondi du levier vers le bas peut augmenter davantage la marge ;
+le levier minimal est de 1×. La marge initiale est approximativement le
+notionnel divisé par ce levier. Pour un marché à 5 % de marge minimale,
+le levier passe de 20× à 13× : une jambe de 200 $ demande environ 15,38 $
+au lieu de 10 $, soit 46,15 $ par plateforme pour trois paires.
+Ce réglage s'applique aux nouvelles ouvertures ; les positions déjà ouvertes
+ne reçoivent pas automatiquement de marge supplémentaire. Prévoir en plus les frais,
 les fundings et les pertes sur chaque plateforme. Un solde de 300 $ par
 plateforme couvre ces exemples, mais la marge requise dépend des marchés.
 Le bot ne vérifie pas le solde disponible avant ouverture et ne répartit

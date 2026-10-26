@@ -509,9 +509,15 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter = Arcus.__new__(Arcus)
         adapter.address, adapter.account = "0x" + "1" * 40, 0
         adapter.post = AsyncMock(return_value={"status": "ACK"})
-        adapter.get = AsyncMock(return_value={"leverages": [{"marketId": 28, "leverage": 20, "marginMode": "ISOLATED"}]})
-        await adapter.set_leverage(market_info()[0])
-        self.assertTrue(adapter.post.call_args.args[1]["isolated"])
+        for fraction, leverage in (("0.05", 13), ("0.10", 6), ("0.125", 5), ("0.5", 1), ("1", 1)):
+            with self.subTest(fraction=fraction):
+                market = market_info()[0]
+                market["initialMarginFraction"] = fraction
+                adapter.get = AsyncMock(return_value={"leverages": [
+                    {"marketId": 28, "leverage": leverage, "marginMode": "ISOLATED"}]})
+                await adapter.set_leverage(market)
+                self.assertEqual(adapter.post.call_args.args[1]["leverage"], leverage)
+                self.assertTrue(adapter.post.call_args.args[1]["isolated"])
 
     async def test_arcus_liquidation_calculation_and_list_positions(self):
         adapter = Arcus.__new__(Arcus)
@@ -656,11 +662,17 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_isolated_leverage_is_confirmed_from_account(self):
         adapter = self.adapter()
-        adapter.account_rows = AsyncMock(return_value=[{"market_id": 14, "margin_mode": 1,
-                                                       "initial_margin_fraction": "5.00"}])
-        await adapter.set_leverage(market_info()[1])
-        self.assertEqual(adapter.signer.update_leverage.call_args.kwargs["leverage"], 20)
-        self.assertEqual(adapter.signer.update_leverage.call_args.kwargs["margin_mode"], 1)
+        for fraction, leverage, confirmed in ((500, 13, "7.69"), (1000, 6, "16.66"),
+                                              (1250, 5, "20.00"), (5000, 1, "100.00"),
+                                              (10000, 1, "100.00")):
+            with self.subTest(fraction=fraction):
+                market = market_info()[1]
+                market["min_initial_margin_fraction"] = fraction
+                adapter.account_rows = AsyncMock(return_value=[{"market_id": 14, "margin_mode": 1,
+                                                               "initial_margin_fraction": confirmed}])
+                await adapter.set_leverage(market)
+                self.assertEqual(adapter.signer.update_leverage.call_args.kwargs["leverage"], leverage)
+                self.assertEqual(adapter.signer.update_leverage.call_args.kwargs["margin_mode"], 1)
 
     async def test_accounting_fees_funding_and_price_pnl(self):
         adapter = self.adapter()

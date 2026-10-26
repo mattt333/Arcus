@@ -16,6 +16,7 @@ ORDER_TIMEOUT = 20
 MAX_SPREAD = min(D(os.getenv("MAX_SPREAD", "0.0003")), D("0.0003"))  # 0,03 % maximum
 OPEN_SLIPPAGE = D("0.0005")
 CLOSE_SLIPPAGE = D("0.02")
+MARGIN_MULTIPLIER = D("1.5")  # +50 % de marge initiale sur chaque plateforme.
 TERMINAL = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "MARGIN_CANCELED"}
 
 
@@ -134,7 +135,7 @@ class Arcus:
         return [(D(str(row["time"])) / 1_000_000, D(row["fundingRate"])) for row in rows]
 
     async def set_leverage(self, market):
-        leverage = int(D(1) / D(market["initialMarginFraction"]))
+        leverage = max(1, int(D(1) / (D(market["initialMarginFraction"]) * MARGIN_MULTIPLIER)))
         await self.post("setLeverage", self.params(marketId=market["marketId"], leverage=leverage, isolated=True))
         deadline = time.monotonic() + ORDER_TIMEOUT
         while time.monotonic() < deadline:
@@ -377,7 +378,7 @@ class Lighter:
 
     async def set_leverage(self, market):
         client = self.client()
-        leverage = int(D(10000) / D(market["min_initial_margin_fraction"]))
+        leverage = max(1, int(D(10000) / (D(market["min_initial_margin_fraction"]) * MARGIN_MULTIPLIER)))
         async with self.lock, asyncio.timeout(TIMEOUT):
             _, response, error = await client.update_leverage(market_index=market["market_id"],
                 margin_mode=client.ISOLATED_MARGIN_MODE, leverage=leverage)
