@@ -386,7 +386,7 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         current = deepcopy(self.exchange.current)
         restarted = MarketMaker(self.exchange, self.path)
         self.exchange.position = AsyncMock(side_effect=[
-            {"size": D(0), "entry": D(0)}, current, current])
+            {"size": D(0), "entry": D(0)}, current, current, current])
         restarted.step = AsyncMock(side_effect=restarted.stop.set)
         restarted.shutdown = AsyncMock()
         with patch.object(restarted, "wait_for_retry", new_callable=AsyncMock), self.assertLogs("xau-mm"):
@@ -677,6 +677,140 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.exchange.canceled)
         self.assertEqual(len(self.exchange.sent), 2)
         leverage.assert_not_called()
+
+    def seed_manually_closed_cycle(self, expected="-.0025"):
+        order = self.seed_missing_quote(status="FILLED", filled=".0025", quantity=".0025",
+                                        side=-1 if D(expected) < 0 else 1)
+        self.maker.state.update(expected_size=expected, cycle_filled=True,
+                                cycle_quantity=".0025", phase="stopping", exit_price="3000.45")
+        self.maker.save()
+        return order
+
+    async def test_manual_short_close_resets_inventory_and_resumes_quotes(self):
+        old_order = deepcopy(self.seed_manually_closed_cycle())
+        with patch.object(self.maker, "wait_for_retry", new_callable=AsyncMock) as wait:
+            await self.maker.initialize()
+        wait.assert_awaited_once_with(5)
+        self.assertTrue(self.maker.initialized)
+        self.assertEqual(self.maker.state["expected_size"], "0")
+        self.assertEqual(self.maker.state["orders"], [])
+        self.assertEqual(self.maker.state["phase"], "quoting")
+        self.assertIsNone(self.maker.state["cycle_quantity"])
+        self.assertFalse(self.maker.state["cycle_filled"])
+        self.assertNotIn("exit_price", self.maker.state)
+        saved = json.loads(self.path.read_text(encoding="utf8"))
+        self.assertEqual(saved["last_flat_recovery"]["previous_expected_size"], "-.0025")
+        self.assertEqual(saved["last_flat_recovery"]["orders"], [old_order])
+        audit = self.path.with_suffix(".orders.jsonl").read_text(encoding="utf8")
+        self.assertIn("external_flat_reconciled", audit)
+        self.assertIn(old_order["id"], audit)
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.exchange.canceled)
+        await self.maker.step()
+        self.assertEqual(len(self.maker.live("quote")), 2)
+
+    async def test_manual_long_close_is_recovered_once_across_restarts(self):
+        self.seed_manually_closed_cycle(expected=".0025")
+        with patch.object(self.maker, "wait_for_retry", new_callable=AsyncMock):
+            await self.maker.initialize()
+        restarted = MarketMaker(self.exchange, self.path)
+        with patch.object(restarted, "wait_for_retry", new_callable=AsyncMock) as wait:
+            await restarted.initialize()
+        wait.assert_not_awaited()
+        self.assertTrue(restarted.initialized)
+        self.assertEqual(restarted.state["last_flat_recovery"]["previous_expected_size"], ".0025")
+        audit = self.path.with_suffix(".orders.jsonl").read_text(encoding="utf8")
+        self.assertEqual(audit.count('"event": "external_flat_reconciled"'), 1)
+
+    async def test_flat_recovery_is_blocked_by_active_quote(self):
+        self.seed_manually_closed_cycle()
+        active = self.seed_missing_quote(id="exit", side=1, status="OPEN")
+        self.exchange.rows["exit"] = deepcopy(active)
+        with patch.object(self.maker, "wait_for_retry", new_callable=AsyncMock) as wait:
+            with self.assertRaises(ReadModelLag):
+                await self.maker.initialize()
+        wait.assert_not_awaited()
+        self.assertEqual(self.maker.state["expected_size"], "-.0025")
+        self.assertNotIn("last_flat_recovery", self.maker.state)
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_flat_recovery_waits_for_invisible_quote_expiry(self):
+        self.seed_manually_closed_cycle()
+        pending = self.seed_missing_quote(id="pending", expires_at_ms=int(time.time() * 1000) + 60000)
+        with patch.object(self.maker, "wait_for_retry", new_callable=AsyncMock) as wait:
+            await self.maker.initialize()
+        self.assertGreater(wait.call_args.args[0], 60)
+        recovery = self.maker.state["last_flat_recovery"]
+        archived = next(o for o in recovery["orders"] if o["id"] == pending["id"])
+        self.assertEqual(archived["status"], "ABSENT")
+        self.assertEqual(self.maker.state["expected_size"], "0")
+
+    async def test_flat_recovery_never_discards_uncertain_market_close(self):
+        self.seed_manually_closed_cycle()
+        self.seed_missing_quote(id="close", kind="close", reduce_only=True)
+        with patch.object(self.maker, "wait_for_retry", new_callable=AsyncMock) as wait:
+            with self.assertRaises(ReadModelLag):
+                await self.maker.initialize()
+        wait.assert_not_awaited()
+        self.assertEqual(self.maker.state["expected_size"], "-.0025")
+        self.assertNotIn("last_flat_recovery", self.maker.state)
+
+    async def test_flat_recovery_second_read_must_confirm_empty_account(self):
+        for method, second in (("position", {"size": D("-.0025"), "entry": D(3000)}),
+                               ("active_orders", [{"client_id": "249670502102335", "status": "OPEN"}])):
+            with self.subTest(method=method):
+                self.seed_manually_closed_cycle()
+                original = getattr(self.exchange, method)
+                calls = 0
+
+                async def changing_account():
+                    nonlocal calls
+                    calls += 1
+                    return second if calls == 3 else await original()
+
+                with patch.object(self.exchange, method, side_effect=changing_account), \
+                        patch.object(self.maker, "wait_for_retry", new_callable=AsyncMock):
+                    with self.assertRaises(ReadModelLag):
+                        await self.maker.initialize()
+                self.assertEqual(self.maker.state["expected_size"], "-.0025")
+                self.assertNotIn("last_flat_recovery", self.maker.state)
+
+    async def test_flat_recovery_api_failure_keeps_inventory(self):
+        for method in ("active_orders", "position"):
+            with self.subTest(method=method):
+                self.seed_manually_closed_cycle()
+                original = getattr(self.exchange, method)
+                calls = 0
+
+                async def failed_read():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 3:
+                        raise RateLimited("429")
+                    return await original()
+
+                with patch.object(self.exchange, method, side_effect=failed_read), \
+                        patch.object(self.maker, "wait_for_retry", new_callable=AsyncMock):
+                    with self.assertRaises(RateLimited):
+                        await self.maker.initialize()
+                self.assertEqual(self.maker.state["expected_size"], "-.0025")
+                self.assertNotIn("last_flat_recovery", self.maker.state)
+
+    async def test_stop_during_flat_recovery_keeps_inventory(self):
+        self.seed_manually_closed_cycle()
+        before = deepcopy(self.maker.state)
+
+        async def stop_retry(delay):
+            self.maker.stop.set()
+
+        with patch.object(self.maker, "wait_for_retry", side_effect=stop_retry):
+            await self.maker.initialize()
+        self.assertFalse(self.maker.initialized)
+        self.assertEqual(self.maker.state, before)
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf8")), before)
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.exchange.canceled)
 
     async def test_legacy_phantom_quote_is_archived_when_grace_elapsed_and_api_flat(self):
         order = self.seed_missing_quote()

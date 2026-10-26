@@ -152,11 +152,24 @@ long. Un arrêt demandé interrompt cette attente. Les autres erreurs de
 configuration ou de compte restent bloquantes et provoquent un échec.
 En cas d'écart, le message indique la position signée sur Lighter et celle
 attendue dans le journal, en XAU. Une nouvelle lecture peut résoudre un
-retard de publication de l'API ; un écart persistant nécessite de vérifier
-le compte et l'historique des exécutions. L'inventaire attendu n'est jamais
-remplacé automatiquement par la position observée. Pendant cette attente,
+retard de publication de l'API ; un écart persistant avec une position encore
+ouverte nécessite de vérifier le compte et l'historique des exécutions.
+Pendant cette attente,
 aucune nouvelle cotation n'est envoyée et le stop n'est pas surveillé.
 Conserver le journal d'état pour permettre cette réconciliation.
+
+Après une fermeture manuelle, si Lighter indique une position nulle mais
+que le journal attend encore une position, le démarrage vérifie deux fois
+que le compte n'a **aucune position ni aucun ordre actif**, avec au moins
+**5 secondes** entre les vérifications. Les quotes introuvables doivent
+également avoir dépassé leur expiration (ou le délai de reprise des anciens
+journaux). Une fermeture MARKET encore incertaine bloque cette récupération.
+Le bot remet alors `expected_size` à zéro, archive l'ancien cycle et reprend
+les cotations. L'ajustement et les anciens ordres sont conservés dans
+`last_flat_recovery` du journal et l'événement `external_flat_reconciled`
+de l'audit. Aucun fichier d'état n'est à supprimer. Une erreur de lecture,
+une position ou un ordre actif pendant les vérifications bloque l'ajustement ;
+un arrêt demandé interrompt l'attente en conservant l'inventaire local.
 
 Un refus explicite du SDK ou de `sendTx` est enregistré comme `REJECTED`,
 avec son message et son code : il ne provoque pas de recherche ou d'annulation
@@ -174,7 +187,8 @@ au SDK. Pour un ancien journal sans date d'expiration, le bot attend une fois
 
 La référence peut alors être classée localement `ABSENT` uniquement si les
 deux lectures confirment qu'il n'y a aucun ordre ouvert ni aucune position,
-et si la position correspond à l'inventaire attendu. Cette classification
+et si la position correspond à l'inventaire attendu, ou après la vérification
+de compte vide décrite pour une fermeture externe. Cette classification
 est conservée dans l'état et l'audit ; elle ne prétend pas qu'une annulation
 ou un refus a été confirmé. Aucune annulation n'est envoyée pour cette référence.
 Le bot peut ensuite reprendre sans renommer ni supprimer le journal.

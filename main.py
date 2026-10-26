@@ -61,7 +61,9 @@ class QuoteUnavailable(ValueError):
 
 
 class ReadModelLag(RuntimeError):
-    pass
+    def __init__(self, message, observed=None):
+        super().__init__(message)
+        self.observed = observed
 
 
 def quote_quantity(market, bid, ask, round_up=True):
@@ -163,7 +165,7 @@ class MarketMaker:
         if position["size"] != expected:
             raise ReadModelLag(
                 f"Position et exécutions non réconciliées : Lighter={position['size']} XAU, "
-                f"journal={expected} XAU ; aucune nouvelle cotation")
+                f"journal={expected} XAU ; aucune nouvelle cotation", observed=position["size"])
         return position
 
     async def cancel(self, order, reason):
@@ -204,7 +206,7 @@ class MarketMaker:
         self.update(order, row)
         return order
 
-    async def startup_snapshot(self):
+    async def startup_snapshot(self, check_position=True):
         """Lire et réconcilier le compte, sans envoyer ni annuler d'ordre."""
         known = {o["id"] for o in self.state["orders"]}
         active = {o["client_id"]: o for o in await self.exchange.active_orders()}
@@ -221,7 +223,47 @@ class MarketMaker:
                 self.update(order, row)
                 if row["status"] not in TERMINAL:
                     active[order["id"]] = row
-        return active, missing, await self.position()
+        position = await self.position() if check_position else await self.exchange.position()
+        return active, missing, position
+
+    def missing_quote_delay(self, missing):
+        return max((max(0, o["expires_at_ms"] / 1000 + RECOVERY_GRACE_SECONDS - time.time())
+                    if "expires_at_ms" in o else max(0, self.legacy_recovery_deadline - time.monotonic())
+                    for o in missing), default=0)
+
+    async def reconcile_external_flat(self):
+        """Réconcilier une fermeture externe après deux lectures du compte vide."""
+        active, missing, position = await self.startup_snapshot(check_position=False)
+        if active or position["size"] or any(o["kind"] != "quote" for o in missing):
+            return False
+
+        # Une quote envoyée mais encore invisible peut réapparaître : attendre
+        # aussi son expiration avant toute remise à zéro de l'inventaire.
+        delay = max(RECOVERY_GRACE_SECONDS, self.missing_quote_delay(missing))
+        log.warning("Position Lighter nulle avec inventaire local : vérification du compte "
+                    "sans ordre actif dans %.1f s avant réconciliation", delay)
+        await self.wait_for_retry(delay)
+        if self.stop.is_set():
+            return False
+        active, missing, position = await self.startup_snapshot(check_position=False)
+        if active or position["size"] or any(o["kind"] != "quote" for o in missing):
+            return False
+
+        checked_at = time.time()
+        for order in missing:
+            order.update(status="ABSENT", recovery={"checked_at": checked_at,
+                "reason": "quote expirée ou non créée ; compte confirmé sans ordre ni position"})
+        recovery = {"checked_at": checked_at, "previous_expected_size": self.state["expected_size"],
+                    "reason": "ajustement externe ; compte confirmé sans ordre ni position",
+                    "orders": self.state["orders"]}
+        self.state["last_flat_recovery"] = recovery
+        self.state["expected_size"] = "0"
+        self.reset_cycle()
+        self.audit("external_flat_reconciled", **recovery)
+        log.warning("Compte Lighter confirmé sans position ni ordre actif : inventaire du journal "
+                    "%s → 0 XAU ; ancien cycle archivé, reprise des cotations",
+                    recovery["previous_expected_size"])
+        return True
 
     async def reconcile_startup(self):
         active, missing, position = await self.startup_snapshot()
@@ -232,9 +274,7 @@ class MarketMaker:
                 "Reprise suspendue : référence introuvable avec un ordre actif, une position "
                 "ou une fermeture incertaine ; aucune annulation envoyée au démarrage")
 
-        delay = max(max(0, o["expires_at_ms"] / 1000 + RECOVERY_GRACE_SECONDS - time.time())
-                    if "expires_at_ms" in o else max(0, self.legacy_recovery_deadline - time.monotonic())
-                    for o in missing)
+        delay = self.missing_quote_delay(missing)
         if delay:
             log.warning("Anciennes quotes introuvables : attente de %.1f s avant vérification du compte ; "
                         "aucune annulation envoyée", delay)
@@ -263,7 +303,15 @@ class MarketMaker:
     async def initialize(self):
         log.info("Journal XAU utilisé : %s", self.path.resolve())
         self.market = await self.exchange.load_market()
-        await self.reconcile_startup()
+        try:
+            await self.reconcile_startup()
+        except ReadModelLag as exc:
+            if exc.observed != 0 or not D(self.state["expected_size"]):
+                raise
+            if not await self.reconcile_external_flat():
+                if self.stop.is_set():
+                    return
+                raise
         if self.stop.is_set():
             return
         position = await self.position()
@@ -440,8 +488,8 @@ class MarketMaker:
                 break
             except (ApiError, ReadModelLag, UncertainOrder) as exc:
                 # Garder le même client et son délai de quota entre tentatives.
-                # Les fills déjà confirmés sont conservés ; aucun inventaire
-                # n'est adopté sans preuve d'exécution dans le journal.
+                # Les fills déjà confirmés sont conservés ; seul un compte
+                # vérifié vide permet l'ajustement d'une fermeture externe.
                 delay = max(retry_delay, self.exchange.retry_after)
                 log.warning("Démarrage suspendu : %s ; nouvelle vérification dans %.1f s ; "
                             "aucune nouvelle cotation, stop non surveillé avant réconciliation", exc, delay)
