@@ -120,6 +120,28 @@ Au redémarrage, les anciennes quotes du journal sont annulées et les
 positions réconciliées avant reprise. Un ordre invisible ou une annulation
 incertaine bloque tout remplacement.
 
+Un refus explicite du SDK ou de `sendTx` est enregistré comme `REJECTED`,
+avec son message et son code : il ne provoque pas de recherche ou d'annulation
+d'un ordre inexistant. Une réponse acceptée conserve le hash de transaction ;
+une exception de transport reste incertaine et fait l'objet d'une réconciliation.
+Le résultat d'envoi est conservé dans le champ `submission` du journal.
+
+Un ancien journal peut déjà contenir un ordre `PENDING` dont la réponse a
+été masquée par une version précédente. Le correctif ne le transforme pas
+automatiquement en refus. Pour repartir avec un journal neuf, arrêter le
+service, attendre au moins une minute pour l'expiration des anciennes quotes,
+puis vérifier sur le même compte Lighter qu'il n'y a **aucun ordre ouvert
+et aucune position**. Uniquement si ces deux conditions sont vérifiées,
+archiver le fichier d'état puis relancer (adapter le chemin si `STATE_FILE`
+est personnalisé) :
+
+```bash
+mv -- xau-mm-state.json "xau-mm-state.before-recovery-$(date +%Y%m%d-%H%M%S).json"
+sudo systemctl start arcus
+```
+
+S'il reste une position ou un ordre, conserver le journal pour réconciliation.
+
 `xau-mm-state.orders.jsonl` conserve les demandes d'ordres, fills,
 annulations, déclenchements du stop et cycles terminés.
 Un verrou sur `xau-mm-state.lock` interdit deux processus utilisant le même

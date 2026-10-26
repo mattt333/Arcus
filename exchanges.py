@@ -17,6 +17,10 @@ class ApiError(RuntimeError):
     pass
 
 
+class OrderRejected(ApiError):
+    """Refus explicite avant acceptation : aucun ordre à annuler."""
+
+
 class UncertainOrder(RuntimeError):
     """Un placement inconnu doit être réconcilié, jamais renvoyé."""
 
@@ -206,13 +210,15 @@ class Lighter:
 
     async def confirm(self, client_id, terminal=False):
         deadline = time.monotonic() + ORDER_TIMEOUT
+        row = None
         while time.monotonic() < deadline:
             row = await self.order_status(client_id)
             if row and (row["status"] in TERMINAL or
                         (not terminal and row["status"] == "OPEN")):
                 return row
             await asyncio.sleep(0.1)
-        raise UncertainOrder(f"Ordre {client_id} non confirmé")
+        status = row["status"] if row else "absent des ordres ouverts et de l'historique"
+        raise UncertainOrder(f"Ordre {client_id} non confirmé : {status}")
 
     @staticmethod
     def units(value, step):
@@ -241,10 +247,30 @@ class Lighter:
             raise ValueError("Type d'ordre inconnu")
         try:
             async with self.lock, asyncio.timeout(TIMEOUT):
-                await client.create_order(**args)
-        except Exception:
-            pass  # Même un timeout peut cacher un ordre accepté : ne jamais le renvoyer.
-        return await self.confirm(order["id"], terminal=kind == "close")
+                transaction, response, error = await client.create_order(**args)
+        except Exception as exc:
+            # Même un timeout peut cacher un ordre accepté : ne jamais le renvoyer.
+            order["submission"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
+        else:
+            if response is not None and response.code != 200:
+                reason = f"code={response.code}, message={getattr(response, 'message', None)}"
+                order["submission"] = {"state": "rejected", "reason": reason}
+                raise OrderRejected(f"Ordre {order['id']} refusé par Lighter : {reason}")
+            if error and transaction is None and response is None:
+                # Le SDK renvoie ce triplet si la signature échoue ou si l'API
+                # répond BadRequest. Il ne faut pas attendre un ordre inexistant.
+                order["submission"] = {"state": "rejected", "reason": str(error)}
+                raise OrderRejected(f"Ordre {order['id']} refusé par le SDK/Lighter : {error}")
+            if response is not None and response.code == 200:
+                order["submission"] = {"state": "accepted",
+                    "tx_hash": getattr(response, "tx_hash", None)}
+            else:
+                order["submission"] = {"state": "unknown", "reason": str(error or "réponse SDK vide")}
+        try:
+            return await self.confirm(order["id"], terminal=kind == "close")
+        except Exception as exc:
+            raise UncertainOrder(
+                f"Ordre {order['id']} non confirmé ; envoi={order['submission']} ; {exc}") from exc
 
     async def cancel(self, order):
         row = await self.order_status(order["id"])
@@ -254,7 +280,15 @@ class Lighter:
         index = int(row["order_index"]) if row else int(order["id"])
         try:
             async with self.lock, asyncio.timeout(TIMEOUT):
-                await client.cancel_order(market_index=self.market["market_id"], order_index=index)
-        except Exception:
-            pass
-        return await self.confirm(order["id"], terminal=True)
+                _, response, error = await client.cancel_order(
+                    market_index=self.market["market_id"], order_index=index)
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+        else:
+            reason = str(error or (f"code={response.code}, message={getattr(response, 'message', None)}"
+                                  if response is not None else "réponse SDK vide"))
+        try:
+            return await self.confirm(order["id"], terminal=True)
+        except Exception as exc:
+            raise UncertainOrder(
+                f"Annulation {order['id']} non confirmée ; réponse SDK/Lighter : {reason} ; {exc}") from exc

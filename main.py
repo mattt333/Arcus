@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from decimal import Decimal as D, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
-from exchanges import Http, Lighter, TERMINAL, UncertainOrder, decimal
+from exchanges import Http, Lighter, OrderRejected, TERMINAL, UncertainOrder, decimal
 
 ORDER_USD = D("10")
 MIN_LIQUIDITY_USD = D("100")
@@ -177,7 +177,16 @@ class MarketMaker:
         self.state["orders"].append(order)
         self.save()  # Enregistrer AVANT tout appel réseau.
         self.audit("order_requested", order=order)
-        self.update(order, await self.exchange.place(order))
+        try:
+            row = await self.exchange.place(order)
+        except OrderRejected as exc:
+            self.update(order, {"status": "REJECTED", "filled": "0"})
+            self.audit("order_rejected", id=order["id"], reason=str(exc))
+            raise
+        finally:
+            # Conserver aussi le résultat d'envoi si la confirmation échoue.
+            self.save()
+        self.update(order, row)
         return order
 
     async def initialize(self):

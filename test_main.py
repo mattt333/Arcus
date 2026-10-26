@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from exchanges import Lighter, TERMINAL, UncertainOrder
+from exchanges import Lighter, OrderRejected, TERMINAL, UncertainOrder
 from main import MarketMaker, QuoteUnavailable, ReadModelLag, quote_quantity, state_lock, stop_hit
 
 
@@ -363,6 +363,35 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         await self.maker.step()
         self.assertEqual(len([o for o in self.exchange.sent if o["side"] == 1]), 1)
 
+    async def test_explicit_rejection_is_terminal_and_not_canceled_on_restart(self):
+        await self.maker.initialize()
+        with patch.object(self.exchange, "place", side_effect=OrderRejected("invalid nonce")):
+            with self.assertRaisesRegex(OrderRejected, "invalid nonce"):
+                await self.maker.step()
+        state = json.loads(self.path.read_text(encoding="utf8"))
+        self.assertEqual(state["orders"][0]["status"], "REJECTED")
+        self.assertEqual(D(state["expected_size"]), 0)
+        self.assertFalse(self.maker.live())
+        restarted = MarketMaker(self.exchange, self.path)
+        await restarted.initialize()
+        await restarted.step()
+        self.assertEqual(len(restarted.live("quote")), 2)
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_submission_details_survive_confirmation_timeout(self):
+        await self.maker.initialize()
+
+        async def accepted_but_not_visible(order):
+            order["submission"] = {"state": "accepted", "tx_hash": "fake-hash"}
+            raise UncertainOrder("non confirmé")
+
+        with patch.object(self.exchange, "place", side_effect=accepted_but_not_visible):
+            with self.assertRaises(UncertainOrder):
+                await self.maker.step()
+        state = json.loads(self.path.read_text(encoding="utf8"))
+        self.assertEqual(state["orders"][0]["submission"]["tx_hash"], "fake-hash")
+        self.assertEqual(state["orders"][0]["status"], "PENDING")
+
     async def test_restart_cancels_old_quotes_and_recovers_inventory(self):
         await self.start()
         bid = self.quote(1)
@@ -494,6 +523,57 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.signer.create_order.await_count, 1)
         adapter.confirm.assert_awaited_once()
 
+    async def test_sdk_rejection_exposes_reason_without_waiting_for_confirmation(self):
+        adapter = self.adapter()
+        adapter.signer.create_order.return_value = (None, None, "invalid nonce")
+        order = self.order()
+        with self.assertRaisesRegex(OrderRejected, "invalid nonce"):
+            await adapter.place(order)
+        adapter.confirm.assert_not_called()
+        self.assertEqual(order["submission"]["state"], "rejected")
+
+    async def test_api_rejection_exposes_code_and_message(self):
+        adapter = self.adapter()
+        adapter.signer.create_order.return_value = (
+            None, SimpleNamespace(code=21111, message="insufficient margin"), None)
+        with self.assertRaisesRegex(OrderRejected, "21111.*insufficient margin"):
+            await adapter.place(self.order())
+        adapter.confirm.assert_not_called()
+
+    async def test_unknown_timeout_stays_uncertain_with_original_context(self):
+        adapter = self.adapter()
+        adapter.signer.create_order.side_effect = TimeoutError()
+        adapter.confirm.side_effect = UncertainOrder("absent")
+        order = self.order()
+        with self.assertRaisesRegex(UncertainOrder, "TimeoutError"):
+            await adapter.place(order)
+        self.assertEqual(order["submission"]["state"], "unknown")
+        self.assertEqual(adapter.signer.create_order.await_count, 1)
+
+    async def test_accepted_but_invisible_order_reports_transaction_hash(self):
+        adapter = self.adapter()
+        adapter.signer.create_order.return_value = (
+            None, SimpleNamespace(code=200, tx_hash="fake-hash"), None)
+        adapter.confirm.side_effect = UncertainOrder("absent")
+        with self.assertRaisesRegex(UncertainOrder, "fake-hash"):
+            await adapter.place(self.order())
+
+    async def test_sdk_exception_message_survives_failed_confirmation(self):
+        adapter = self.adapter()
+        adapter.signer.create_order.side_effect = RuntimeError("SDK transport unavailable")
+        adapter.confirm.side_effect = UncertainOrder("absent")
+        with self.assertRaisesRegex(UncertainOrder, "SDK transport unavailable"):
+            await adapter.place(self.order())
+
+    async def test_empty_sdk_response_is_not_treated_as_explicit_rejection(self):
+        adapter = self.adapter()
+        adapter.signer.create_order.return_value = (None, None, None)
+        adapter.confirm.side_effect = UncertainOrder("absent")
+        order = self.order()
+        with self.assertRaises(UncertainOrder):
+            await adapter.place(order)
+        self.assertEqual(order["submission"]["state"], "unknown")
+
     async def test_invalid_quantity_is_rejected_before_sending(self):
         adapter = self.adapter()
         with self.assertRaises(ValueError):
@@ -548,6 +628,14 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.confirm.return_value = {"status": "CANCELED", "filled": "0"}
         await adapter.cancel(self.order())
         self.assertEqual(adapter.signer.cancel_order.call_args.kwargs["order_index"], 123)
+
+    async def test_failed_cancel_exposes_reason_without_marking_order_terminal(self):
+        adapter = self.adapter()
+        adapter.order_status = AsyncMock(return_value=None)
+        adapter.signer.cancel_order.return_value = (None, None, "order not found")
+        adapter.confirm.side_effect = UncertainOrder("absent")
+        with self.assertRaisesRegex(UncertainOrder, "order not found"):
+            await adapter.cancel(self.order())
 
     async def test_canceled_post_only_is_terminal(self):
         row = Lighter.normalize({"status": "canceled-post-only", "client_order_index": 123,
