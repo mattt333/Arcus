@@ -49,18 +49,16 @@ L'API publique XAU a été consultée pendant la refonte : minimum de **10 $**,
 quantité minimale **0,0020 XAU**, pas **0,0001 XAU**, tick de prix **0,01 $**.
 Les valeurs sont relues depuis l'API au démarrage.
 
-Le mode par défaut impose un plafond strict de 10 $ par ordre d'entrée.
-Si le pas de quantité et le minimum de Lighter sont incompatibles avec ce
-plafond, **le bot ne place aucun ordre**. Avec un minimum de 10 $ et deux
-prix différents pour une même quantité, les deux quotes ne peuvent pas
-toutes deux être exactement à 10 $.
-
-`ROUND_ORDER_UP=1` autorise explicitement le premier pas de quantité
-au-dessus de 10 $ au bid, avec la même quantité à l'ask. Par exemple, autour
+Par défaut, **10 $ est une taille cible** : le bot utilise le premier pas
+de quantité qui atteint 10 $ au bid, avec la même quantité à l'ask.
+L'arrondi est activé par défaut (`ROUND_ORDER_UP=1`). Par exemple, autour
 de 4020 $, 0,0024 XAU valent environ 9,65 $ et 0,0025 XAU environ 10,05 $.
 Dans ce mode, le plafond d'inventaire est la quantité de cette unique paire
 de quotes arrondie ; sa valeur peut dépasser 10 $ et fluctue avec le prix.
-Sans ce réglage explicite, aucun dépassement n'est autorisé.
+`ROUND_ORDER_UP=0` réactive le plafond strict de 10 $. Ce mode peut bloquer
+les entrées : avec le minimum actuel de 10 $ et deux prix différents pour
+une même quantité, les deux quotes ne peuvent pas toutes deux être exactement
+à 10 $. Si le service définit déjà cette variable à `0`, la passer à `1`.
 
 Les sorties reduce-only utilisent la quantité réelle restante, qui peut
 être inférieure au minimum d'une nouvelle entrée après un fill partiel.
@@ -78,8 +76,8 @@ export LIGHTER_API_KEY_INDEX='...'
 export LIGHTER_API_PRIVATE_KEY='...'
 export STATE_FILE='xau-mm-state.json'
 
-# Seulement si l'arrondi minimal au-dessus de 10 $ est souhaité :
-# export ROUND_ORDER_UP='1'
+# Valeur par défaut ; remplace un éventuel ancien réglage à 0 :
+export ROUND_ORDER_UP='1'
 
 .venv/bin/python main.py
 ```

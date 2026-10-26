@@ -97,13 +97,20 @@ class SizingTests(unittest.TestCase):
     def test_strict_ten_dollars_never_rounds_above_cap(self):
         m = market()
         m["min_quote_amount"] = "0"
-        quantity = quote_quantity(m, D("3000.45"), D("3000.55"))
+        quantity = quote_quantity(m, D("3000.45"), D("3000.55"), round_up=False)
         self.assertLessEqual(quantity * D("3000.55"), D(10))
         self.assertEqual(quantity % m["step"], 0)
 
     def test_strict_cap_blocks_when_exchange_minimum_is_ten(self):
         with self.assertRaises(QuoteUnavailable):
-            quote_quantity(market(), D("3000.45"), D("3000.55"))
+            quote_quantity(market(), D("3000.45"), D("3000.55"), round_up=False)
+
+    def test_default_sizing_accepts_ten_dollar_target_with_xau_minimum(self):
+        bid, ask = D("4022.04"), D("4022.45")
+        quantity = quote_quantity(market(), bid, ask)
+        self.assertEqual(quantity, D(".0025"))
+        self.assertGreaterEqual(quantity * bid, D(10))
+        self.assertLess((quantity - market()["step"]) * bid, D(10))
 
     def test_authorized_rounding_uses_first_step_above_ten(self):
         bid, ask = D("3000.45"), D("3000.55")
@@ -153,6 +160,14 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bid["quantity"], ask["quantity"])
         self.assertFalse(bid["reduce_only"])
         self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_default_configuration_places_quotes_without_rounding_override(self):
+        self.maker = MarketMaker(self.exchange, self.path)
+        await self.start()
+        self.assertEqual(len(self.exchange.sent), 2)
+        self.assertEqual(self.quote(1)["quantity"], self.quote(-1)["quantity"])
+        for order in self.exchange.sent:
+            self.assertGreaterEqual(D(order["quantity"]) * D(order["price"]), D(10))
 
     async def test_no_duplicate_quotes_on_repeated_cycles(self):
         await self.start()

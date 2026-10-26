@@ -18,8 +18,8 @@ STOP_DISTANCE = D("1")
 POLL_SECONDS = 0.5
 CLOSE_SLIPPAGE = D("0.02")
 STATE_FILE = Path(os.getenv("STATE_FILE", "xau-mm-state.json"))
-# Le plafond strict de 10 $ reste la règle tant que l'arrondi n'est pas autorisé.
-ROUND_ORDER_UP = os.getenv("ROUND_ORDER_UP", "0") == "1"
+# 10 $ est une cible : utiliser le premier pas XAU qui atteint ce notionnel.
+ROUND_ORDER_UP = os.getenv("ROUND_ORDER_UP", "1") == "1"
 log = logging.getLogger("xau-mm")
 
 
@@ -59,7 +59,7 @@ class ReadModelLag(RuntimeError):
     pass
 
 
-def quote_quantity(market, bid, ask, round_up=False):
+def quote_quantity(market, bid, ask, round_up=True):
     """Même quantité des deux côtés, pour que l'ordre opposé puisse solder."""
     step = market["step"]
     if round_up:
