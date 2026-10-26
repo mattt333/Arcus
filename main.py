@@ -18,7 +18,8 @@ STOP_DISTANCE = D("1")
 POLL_SECONDS = 0.5
 CLOSE_SLIPPAGE = D("0.02")
 RECOVERY_GRACE_SECONDS = 5
-LEGACY_QUOTE_WAIT_SECONDS = QUOTE_TTL_SECONDS + RECOVERY_GRACE_SECONDS
+# Old versions without a persisted expiry submitted 60-second quotes.
+LEGACY_QUOTE_WAIT_SECONDS = 60 + RECOVERY_GRACE_SECONDS
 STATE_FILE = Path(os.getenv("STATE_FILE", "xau-mm-state.json"))
 # 10 $ est une cible : utiliser le premier pas XAU qui atteint ce notionnel.
 ROUND_ORDER_UP = os.getenv("ROUND_ORDER_UP", "1") == "1"
@@ -429,7 +430,8 @@ class MarketMaker:
                     try:
                         await self.cancel_quotes("données indisponibles ou ordre incertain")
                     except Exception:
-                        log.exception("URGENT : annulation non confirmée ; quotes expirent sous 60 s")
+                        log.exception("URGENT : annulation non confirmée ; expiration prévue des quotes "
+                                      "au plus tard %s s après leur création", QUOTE_TTL_SECONDS)
                 try:
                     await asyncio.wait_for(self.stop.wait(), POLL_SECONDS)
                 except TimeoutError:

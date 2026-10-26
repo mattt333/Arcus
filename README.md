@@ -104,7 +104,10 @@ pause de **0,5 seconde entre les cycles**. Les temps réseau et les délais
 de confirmation s'ajoutent à cette pause. Ce n'est pas un flux WebSocket :
 les annulations et le stop interviennent au moment de l'observation.
 
-Les quotes expirent après 60 secondes si elles ne sont plus suivies.
+Les quotes expirent 6 minutes après leur création. Lighter impose un délai
+minimal de 5 minutes ; la minute supplémentaire couvre les délais d'envoi.
+La date est transmise en millisecondes Unix. Cette expiration reste un recours
+en cas de perte de contact ; les annulations normales sont gérées à chaque cycle.
 Une quote expirée peut être recréée après réconciliation.
 Le carnet contient au maximum les 250 premiers ordres par côté ; une
 liquidité absente du snapshot est traitée comme insuffisante.

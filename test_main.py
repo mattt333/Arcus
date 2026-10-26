@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from copy import deepcopy
 from decimal import Decimal as D
@@ -561,6 +562,8 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
             saved = json.loads(self.path.read_text(encoding="utf8"))
             recorded = next(o for o in saved["orders"] if o["id"] == order["id"])
             self.assertEqual(recorded["expires_at_ms"], order["expires_at_ms"])
+            # Lighter's minimum validity period is 300,000 milliseconds.
+            self.assertGreater(recorded["expires_at_ms"] - int(time.time() * 1000), 300000)
             return await original(order)
 
         with patch.object(self.exchange, "place", side_effect=verify_expiry):
@@ -685,6 +688,17 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
         await adapter.place(order)
         self.assertEqual(adapter.signer.create_order.call_args.kwargs["order_expiry"],
                          order["expires_at_ms"])
+
+    async def test_quote_expiry_respects_lighter_minimum_in_milliseconds(self):
+        adapter = self.adapter()
+        now = 1793000000.125
+        with patch("exchanges.time.time", return_value=now):
+            await adapter.place(self.order())
+        expiry = adapter.signer.create_order.call_args.kwargs["order_expiry"]
+        # Official MinOrderExpiryPeriod is 1000 * 60 * 5. A 60-second
+        # expiry signs successfully but is rejected by the exchange (21711).
+        self.assertGreater(expiry - int(now * 1000), 300000)
+        self.assertEqual(expiry, int(now * 1000) + 360000)
 
     async def test_timeout_does_not_resend_order(self):
         adapter = self.adapter()
@@ -838,15 +852,17 @@ class LighterAdapterTests(unittest.IsolatedAsyncioTestCase):
         client = lighter.SignerClient(url=Lighter.MAINNET, account_index=1,
                                       api_private_keys={4: "1" * 80}, chain_id=Lighter.CHAIN_ID)
         try:
+            expiry = int(time.time() * 1000) + 360000
             _, body, _, error = client.sign_create_order(market_index=40, client_order_index=123,
                 base_amount=34, price=300045, is_ask=0, order_type=client.ORDER_TYPE_LIMIT,
                 time_in_force=client.ORDER_TIME_IN_FORCE_POST_ONLY, reduce_only=False,
-                order_expiry=1790000060000, nonce=1, api_key_index=4)
+                order_expiry=expiry, nonce=1, api_key_index=4)
             self.assertIsNone(error)
             signed = json.loads(body)
             self.assertEqual(signed["MarketIndex"], 40)
             self.assertEqual(signed["TimeInForce"], 2)
             self.assertEqual(signed["BaseAmount"], 34)
+            self.assertEqual(signed["OrderExpiry"], expiry)
             self.assertTrue(signed["Sig"])
         finally:
             await client.close()

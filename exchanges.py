@@ -8,7 +8,10 @@ import aiohttp
 
 TIMEOUT = 10
 ORDER_TIMEOUT = 10
-QUOTE_TTL_SECONDS = 60
+# Lighter requires at least 5 minutes, in Unix milliseconds:
+# https://github.com/elliottech/lighter-go/blob/main/types/txtypes/constants.go
+# Allow another minute for signing, transmission and clock differences.
+QUOTE_TTL_SECONDS = 6 * 60
 MARKET = "XAU-USD"
 MARGIN_MULTIPLIER = D("1.5")
 TERMINAL = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "ABSENT"}
