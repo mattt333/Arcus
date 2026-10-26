@@ -190,12 +190,19 @@ class MarketMaker:
         return order
 
     async def initialize(self):
+        log.info("Journal XAU utilisé : %s", self.path.resolve())
         self.market = await self.exchange.load_market()
         known = {o["id"] for o in self.state["orders"]}
         if any(o["client_id"] not in known for o in await self.exchange.active_orders()):
             raise ValueError("Ordres externes détectés : compte dédié XAU requis")
         # Au redémarrage, annuler aussi les placements dont la réponse a été perdue.
-        await self.cancel_quotes("démarrage / réconciliation")
+        try:
+            await self.cancel_quotes("démarrage / réconciliation")
+        except UncertainOrder as exc:
+            raise UncertainOrder(
+                f"Reprise bloquée par le journal {self.path.resolve()} : {exc}. "
+                "Aucun nouveau placement envoyé. Conserver le journal tant qu'un ordre "
+                "ou une position subsiste sur le compte ; procédure de reprise dans README.md.") from exc
         await self.refresh()
         position = await self.position()
         if not position["size"]:

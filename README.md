@@ -128,7 +128,13 @@ Le résultat d'envoi est conservé dans le champ `submission` du journal.
 
 Un ancien journal peut déjà contenir un ordre `PENDING` dont la réponse a
 été masquée par une version précédente. Le correctif ne le transforme pas
-automatiquement en refus. Pour repartir avec un journal neuf, arrêter le
+automatiquement en refus. Le chemin absolu du journal effectivement utilisé
+est affiché au démarrage (`Journal XAU utilisé`) et dans l'erreur de reprise.
+Il peut différer de `xau-mm-state.json` si le service définit `STATE_FILE`.
+Un code `200` accompagné de `{"ratelimit": "didn't use volume quota"}`
+est une réponse acceptée avec une information de quota, pas un refus pour
+limite de requêtes ni une preuve d'annulation exécutée.
+Pour repartir avec un journal neuf, arrêter le
 service, attendre au moins une minute pour l'expiration des anciennes quotes,
 puis vérifier sur le même compte Lighter qu'il n'y a **aucun ordre ouvert
 et aucune position**. Uniquement si ces deux conditions sont vérifiées,
