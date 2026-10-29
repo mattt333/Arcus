@@ -16,8 +16,10 @@ ORDER_USD = D("10")
 MIN_LIQUIDITY_USD = D("100")
 STOP_DISTANCE = D("1")
 POLL_SECONDS = 0.5
+POSITION_RECONCILE_RETRIES = 2
 STARTUP_RETRY_SECONDS = 5
 MAX_STARTUP_RETRY_SECONDS = 60
+API_RETRY_SECONDS = 60
 CLOSE_SLIPPAGE = D("0.02")
 RECOVERY_GRACE_SECONDS = 5
 # Old versions without a persisted expiry submitted 60-second quotes.
@@ -128,6 +130,7 @@ class MarketMaker:
                 raise ValueError("Journal incompatible avec cette stratégie ou ce compte")
         self.initialized = False
         self.legacy_recovery_deadline = time.monotonic() + LEGACY_QUOTE_WAIT_SECONDS
+        self.outage_legacy_deadline = time.monotonic() + QUOTE_TTL_SECONDS + RECOVERY_GRACE_SECONDS
 
     def save(self):
         temporary = self.path.with_suffix(".tmp")
@@ -227,10 +230,26 @@ class MarketMaker:
         orders = list(self.live())
         rows = await self.exchange.order_statuses([order["id"] for order in orders])
         for order in orders:
-            self.update(order, rows[order["id"]])
+            if rows[order["id"]] is not None:
+                self.update(order, rows[order["id"]])
+        missing = [o["id"] for o in orders if rows[o["id"]] is None]
+        if missing:
+            raise UncertainOrder(f"Ordres invisibles : {', '.join(missing)} ; nouvelles cotations suspendues")
 
     async def position(self):
         position = await self.exchange.position()
+        # Les endpoints REST ne forment pas un snapshot atomique : un fill
+        # peut apparaître entre la lecture des ordres et celle de la position.
+        # Relire les deux sources avant de traiter cet écart comme persistant.
+        if self.initialized:
+            for _ in range(POSITION_RECONCILE_RETRIES):
+                if position["size"] == D(self.state["expected_size"]) or self.stop.is_set():
+                    break
+                await self.wait_for_retry(POLL_SECONDS)
+                if self.stop.is_set():
+                    break
+                await self.refresh()
+                position = await self.exchange.position()
         expected = D(self.state["expected_size"])
         if position["size"] != expected:
             raise ReadModelLag(
@@ -387,7 +406,10 @@ class MarketMaker:
         log.info("Journal XAU utilisé : %s", self.path.resolve())
         self.market = await self.exchange.load_market()
         try:
-            await self.reconcile_startup()
+            if self.state.get("recovery_pending"):
+                await self.recover_after_outage()
+            else:
+                await self.reconcile_startup()
         except ReadModelLag as exc:
             if exc.observed != 0 or not D(self.state["expected_size"]):
                 raise
@@ -400,8 +422,79 @@ class MarketMaker:
         position = await self.position()
         if not position["size"] and not self.live():
             await self.exchange.set_leverage()
+        self.state.pop("recovery_pending", None)
         self.save()
         self.initialized = True
+
+    async def recover_after_outage(self):
+        """Relire le compte avant de reprendre ; aucun envoi pendant la reprise."""
+        _, missing, position = await self.startup_snapshot(check_position=False)
+        if not missing:
+            if position["size"] != D(self.state["expected_size"]):
+                if not position["size"] and await self.reconcile_external_flat():
+                    return
+                await self.position()  # Retard de publication ou écart persistant.
+            return
+
+        def check_expired(orders):
+            for order in orders:
+                if order["kind"] != "quote":
+                    raise UncertainOrder("Fermeture MARKET introuvable ; reprise suspendue")
+                delay = (order["expires_at_ms"] / 1000 + RECOVERY_GRACE_SECONDS - time.time()
+                         if "expires_at_ms" in order else self.outage_legacy_deadline - time.monotonic())
+                if delay > 0:
+                    raise UncertainOrder(f"Quote {order['id']} introuvable ; expiration encore attendue")
+
+        check_expired(missing)
+        first_ids = {o["id"] for o in missing}
+        first_position = position
+        await self.wait_for_retry(RECOVERY_GRACE_SECONDS)
+        if self.stop.is_set():
+            return
+        _, missing, position = await self.startup_snapshot(check_position=False)
+        check_expired(missing)
+        if first_ids != {o["id"] for o in missing} or position != first_position:
+            raise UncertainOrder("Compte modifié entre les vérifications ; reprise à retenter")
+
+        # Seules les exécutions inconnues de ces quotes peuvent expliquer
+        # l'écart. Ne pas absorber une position étrangère au cycle du journal.
+        expected = D(self.state["expected_size"])
+        lower = expected - sum((D(o["quantity"]) - D(o["filled"])
+                                for o in missing if o["side"] == -1), D(0))
+        upper = expected + sum((D(o["quantity"]) - D(o["filled"])
+                                for o in missing if o["side"] == 1), D(0))
+        size = position["size"]
+        if not lower <= size <= upper:
+            raise ReadModelLag("Position hors des exécutions possibles des quotes expirées", observed=size)
+
+        # Si le fill d'entrée a disparu de l'historique, utiliser uniquement
+        # un prix opposé enregistré sans ambiguïté avant son envoi.
+        side = 1 if size > 0 else -1
+        if size and self.state.get("exit_side") != -side:
+            prices = {o["opposite_price"] for o in self.state["orders"]
+                      if o["kind"] == "quote" and o["side"] == side
+                      and not o["reduce_only"] and o["status"] != "REJECTED"
+                      and o.get("opposite_price") is not None}
+            if not prices:
+                prices = {o["price"] for o in self.state["orders"]
+                          if o["kind"] == "quote" and o["side"] == -side
+                          and not o["reduce_only"] and o["status"] != "REJECTED"
+                          and side * (D(o["price"]) - position["entry"]) > 0}
+            if len(prices) == 1:
+                self.state.update(exit_side=-side, exit_price=prices.pop())
+
+        recovery = {"checked_at": time.time(), "previous_expected_size": str(expected),
+                    "observed_size": str(size), "missing_orders": [dict(o) for o in missing],
+                    "reason": "quotes expirées introuvables ; position vérifiée deux fois après panne API"}
+        for order in missing:
+            order.update(status="ABSENT", recovery={"checked_at": recovery["checked_at"],
+                         "reason": recovery["reason"]})
+        self.state["expected_size"] = str(size)
+        self.state["cycle_filled"] = self.state["cycle_filled"] or bool(size) or size != expected
+        self.state["last_api_recovery"] = recovery
+        self.save()
+        self.audit("api_orders_reconciled", **recovery)
+        log.warning("Reprise API : quotes expirées archivées ; inventaire %s → %s XAU", expected, size)
 
     def reset_cycle(self):
         if self.live() or D(self.state["expected_size"]):
@@ -554,39 +647,65 @@ class MarketMaker:
         except TimeoutError:
             pass
 
+    async def cancel_after_error(self):
+        try:
+            await self.cancel_quotes("données indisponibles ou ordre incertain")
+        except (ApiError, UncertainOrder) as exc:
+            log.error("URGENT : annulation non confirmée ; expiration prévue des quotes "
+                      "au plus tard %s s après leur création ; %s", QUOTE_TTL_SECONDS, exc)
+        except Exception:
+            log.exception("URGENT : annulation non confirmée ; expiration prévue des quotes "
+                          "au plus tard %s s après leur création", QUOTE_TTL_SECONDS)
+
     async def run(self):
-        retry_delay = STARTUP_RETRY_SECONDS
         while not self.stop.is_set():
             try:
                 await self.initialize()
                 break
             except (ApiError, ReadModelLag, UncertainOrder) as exc:
                 # Garder le même client et son délai de quota entre tentatives.
-                # Les fills déjà confirmés sont conservés ; seul un compte
-                # vérifié vide permet l'ajustement d'une fermeture externe.
-                delay = max(retry_delay, self.exchange.retry_after)
+                # Les fills confirmés restent conservés. La reprise vérifiera
+                # aussi les quotes expirées si l'historique est incomplet.
+                self.state["recovery_pending"] = True
+                self.save()
+                delay = max(API_RETRY_SECONDS, self.exchange.retry_after)
                 log.warning("Démarrage suspendu : %s ; nouvelle vérification dans %.1f s ; "
                             "aucune nouvelle cotation, stop non surveillé avant réconciliation", exc, delay)
                 await self.wait_for_retry(delay)
-                retry_delay = min(retry_delay * 2, MAX_STARTUP_RETRY_SECONDS)
         if not self.initialized:
             return
         try:
             while not self.stop.is_set():
+                delay = POLL_SECONDS
                 try:
+                    if self.state.get("recovery_pending"):
+                        await self.recover_after_outage()
+                        if self.stop.is_set():
+                            break
+                        self.state.pop("recovery_pending")
+                        self.save()
+                        log.info("API et compte réconciliés ; vérification du stop puis reprise du cycle")
                     await self.step()
                 except QuoteRetryPending:
                     # Le prochain cycle relit position/carnet et surveille le
                     # stop ; seule la soumission des quotes refusées attend.
                     pass
+                except OrderRejected as exc:
+                    log.warning("Cycle suspendu : %s ; tentative d'annulation des quotes", exc)
+                    await self.cancel_after_error()
+                except (ReadModelLag, ApiError, UncertainOrder) as exc:
+                    first_failure = not self.state.get("recovery_pending")
+                    self.state["recovery_pending"] = True
+                    self.save()
+                    log.warning("Cotation suspendue : %s ; nouvelle vérification dans au moins %s s ; "
+                                "stop non surveillé pendant l'indisponibilité", exc, API_RETRY_SECONDS)
+                    if first_failure:
+                        await self.cancel_after_error()
+                    delay = API_RETRY_SECONDS
                 except Exception:
                     log.exception("Cycle suspendu ; tentative d'annulation des quotes")
-                    try:
-                        await self.cancel_quotes("données indisponibles ou ordre incertain")
-                    except Exception:
-                        log.exception("URGENT : annulation non confirmée ; expiration prévue des quotes "
-                                      "au plus tard %s s après leur création", QUOTE_TTL_SECONDS)
-                await self.wait_for_retry(max(POLL_SECONDS, self.exchange.retry_after))
+                    await self.cancel_after_error()
+                await self.wait_for_retry(max(delay, self.exchange.retry_after))
         finally:
             if self.initialized:
                 await self.shutdown()

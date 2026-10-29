@@ -254,6 +254,14 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ApiError):
             await self.http.get("active", {})
 
+    async def test_invalid_json_response_is_api_failure_then_next_read_can_recover(self):
+        response = self.respond()
+        response.json.side_effect = json.JSONDecodeError("Expecting value", "", 0)
+        with self.assertRaises(ApiError):
+            await self.http.get("history", {})
+        self.respond()
+        self.assertEqual(await self.http.get("history", {}), {"code": 200})
+
 
 class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -328,14 +336,16 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.exchange.retry_after = 30
 
         async def wait_for_stop(event, delay):
-            self.assertEqual(delay, 30)
+            self.assertEqual(delay, 60)
             self.maker.stop.set()
             await event
 
-        with patch("main.asyncio.wait_for", side_effect=wait_for_stop), self.assertLogs("xau-mm"):
+        with patch("main.asyncio.wait_for", side_effect=wait_for_stop), self.assertLogs("xau-mm") as logs:
             await self.maker.run()
         self.maker.step.assert_awaited_once()
         self.maker.cancel_quotes.assert_awaited_once()
+        self.assertTrue(any("URGENT" in record.getMessage() for record in logs.records))
+        self.assertTrue(all(record.exc_info is None for record in logs.records))
 
     async def test_startup_429_waits_for_quota_then_initializes_in_same_process(self):
         self.exchange.load_market = AsyncMock(side_effect=[RateLimited("429"), market()])
@@ -345,7 +355,7 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
 
         async def retry(delay):
             if not self.maker.initialized:
-                self.assertEqual(delay, 35)
+                self.assertEqual(delay, 60)
                 self.assertFalse(self.exchange.sent)
                 self.assertFalse(self.exchange.canceled)
                 self.exchange.retry_after = 0
@@ -372,7 +382,7 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.maker, "wait_for_retry", side_effect=retry), self.assertLogs("xau-mm"):
             await self.maker.run()
-        self.assertEqual(delays, [5, 10, 20, 40, 60, 60])
+        self.assertEqual(delays, [60] * 6)
         self.assertFalse(self.maker.initialized)
         self.maker.step.assert_not_awaited()
         self.maker.shutdown.assert_not_awaited()
@@ -387,14 +397,14 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.maker.shutdown = AsyncMock()
 
         async def stop_retry(delay):
-            self.assertEqual(delay, 5)
+            self.assertEqual(delay, 60)
             self.maker.stop.set()
 
         with patch.object(self.maker, "wait_for_retry", side_effect=stop_retry), self.assertLogs("xau-mm", level="WARNING") as logs:
             await self.maker.run()
         self.assertIn("Lighter=0.0034 XAU, journal=0 XAU", logs.output[0])
-        self.assertEqual(self.maker.state, before)
-        self.assertEqual(json.loads(self.path.read_text(encoding="utf8")), before)
+        self.assertEqual(self.maker.state, {**before, "recovery_pending": True})
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf8")), self.maker.state)
         self.assertEqual(order["status"], "PENDING")
         self.maker.step.assert_not_awaited()
         self.maker.shutdown.assert_not_awaited()
@@ -423,7 +433,7 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
         self.maker.shutdown = AsyncMock()
 
         async def stop_wait(event, delay):
-            self.assertEqual(delay, 5)
+            self.assertEqual(delay, 60)
             self.maker.stop.set()
             await event
 
@@ -815,10 +825,313 @@ class MarketMakerTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_entry_during_position_read_model_lag(self):
         await self.start()
         self.exchange.fill(self.quote(1)["id"])
-        with patch.object(self.exchange, "position", AsyncMock(return_value={"size": D(0), "entry": D(0)})):
+        expected = self.exchange.current["size"]
+        with patch.object(self.exchange, "position", AsyncMock(return_value={"size": D(0), "entry": D(0)})) as read, \
+                patch.object(self.maker, "wait_for_retry", AsyncMock()) as wait:
             with self.assertRaises(ReadModelLag):
                 await self.maker.step()
+        self.assertEqual(read.await_count, 3)
+        self.assertEqual(wait.await_count, 2)
+        self.assertEqual(D(self.maker.state["expected_size"]), expected)
         self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_position_ahead_of_order_snapshot_keeps_original_exit(self):
+        await self.start()
+        bid, ask = self.quote(1), self.quote(-1)
+        snapshot = {o["id"]: deepcopy(self.exchange.rows[o["id"]]) for o in (bid, ask)}
+        self.exchange.fill(bid["id"])
+        original = self.exchange.order_statuses
+        reads = 0
+
+        async def statuses(ids):
+            nonlocal reads
+            reads += 1
+            return snapshot if reads == 1 else await original(ids)
+
+        with patch.object(self.exchange, "order_statuses", side_effect=statuses), \
+                patch.object(self.maker, "wait_for_retry", AsyncMock()) as wait:
+            await self.maker.step()
+        wait.assert_awaited_once()
+        self.assertEqual(self.quote(-1)["id"], ask["id"])
+        self.assertEqual(D(self.maker.state["exit_price"]), D(ask["price"]))
+        self.assertFalse(self.exchange.canceled)
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_order_fill_ahead_of_position_keeps_original_exit(self):
+        await self.start()
+        ask = self.quote(-1)
+        self.exchange.fill(self.quote(1)["id"])
+        with patch.object(self.exchange, "position", side_effect=[
+                {"size": D(0), "entry": D(0)}, deepcopy(self.exchange.current)]), \
+                patch.object(self.maker, "wait_for_retry", AsyncMock()) as wait:
+            await self.maker.step()
+        wait.assert_awaited_once()
+        self.assertEqual(self.quote(-1)["id"], ask["id"])
+        self.assertFalse(self.exchange.canceled)
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_exit_fill_between_order_and_position_reads_finishes_cycle(self):
+        await self.start()
+        self.exchange.fill(self.quote(1)["id"])
+        await self.maker.step()
+        ask = self.quote(-1)
+        original = self.exchange.position
+
+        async def position():
+            if self.exchange.current["size"]:
+                self.exchange.fill(ask["id"])
+            return await original()
+
+        with patch.object(self.exchange, "position", side_effect=position), \
+                patch.object(self.maker, "wait_for_retry", AsyncMock()):
+            await self.maker.step()
+        self.assertEqual(D(self.maker.state["expected_size"]), 0)
+        self.assertFalse(self.maker.state["cycle_filled"])
+        self.assertFalse(self.maker.live())
+        self.assertFalse(self.exchange.canceled)
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_api_failure_during_reconciliation_preserves_inventory(self):
+        await self.start()
+        self.exchange.fill(self.quote(1)["id"])
+        with patch.object(self.exchange, "position", side_effect=[
+                {"size": D(0), "entry": D(0)}, ApiError("lecture indisponible")]), \
+                patch.object(self.maker, "wait_for_retry", AsyncMock()):
+            with self.assertRaises(ApiError):
+                await self.maker.step()
+        self.assertEqual(D(self.maker.state["expected_size"]), self.exchange.current["size"])
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_stop_interrupts_position_reconciliation_without_new_orders(self):
+        await self.start()
+        self.exchange.fill(self.quote(1)["id"])
+        with patch.object(self.exchange, "position", return_value={"size": D(0), "entry": D(0)}) as read, \
+                patch.object(self.maker, "wait_for_retry", side_effect=lambda _: self.maker.stop.set()) as wait:
+            with self.assertRaises(ReadModelLag):
+                await self.maker.step()
+        wait.assert_awaited_once()
+        read.assert_awaited_once()
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_matching_position_needs_no_reconciliation(self):
+        await self.start()
+        with patch.object(self.maker, "refresh", AsyncMock()) as refresh, \
+                patch.object(self.maker, "wait_for_retry", AsyncMock()) as wait:
+            await self.maker.position()
+        refresh.assert_not_awaited()
+        wait.assert_not_awaited()
+
+    async def test_expected_cycle_errors_log_without_traceback_and_cancel_quotes(self):
+        for error in (ReadModelLag("positions divergentes", observed=D(0)),
+                      ApiError("lecture indisponible"), UncertainOrder("ordre invisible"),
+                      RuntimeError("erreur inattendue")):
+            with self.subTest(error=type(error).__name__):
+                self.maker.stop.clear()
+                self.maker.initialized = True
+                with patch.object(self.maker, "initialize", AsyncMock()), \
+                        patch.object(self.maker, "step", AsyncMock(side_effect=error)), \
+                        patch.object(self.maker, "cancel_quotes", AsyncMock()) as cancel, \
+                        patch.object(self.maker, "shutdown", AsyncMock()), \
+                        patch.object(self.maker, "wait_for_retry", side_effect=lambda _: self.maker.stop.set()), \
+                        self.assertLogs("xau-mm", level="WARNING") as logs:
+                    await self.maker.run()
+                cancel.assert_awaited_once()
+                self.assertEqual(bool(logs.records[0].exc_info), type(error) is RuntimeError)
+
+    async def test_outage_retries_once_a_minute_without_repeated_cancellations(self):
+        await self.start()
+        original_step = self.maker.step
+        attempts, delays = [], []
+        self.exchange.retry_after = 90
+
+        async def step():
+            attempts.append("step")
+            if len(attempts) == 1:
+                raise ApiError("réponse HTML")
+            await original_step()
+            self.maker.stop.set()
+
+        async def wait(delay):
+            delays.append(delay)
+            if len(delays) == 1:
+                self.assertTrue(json.loads(self.path.read_text())["recovery_pending"])
+                self.exchange.retry_after = 0
+
+        with patch.object(self.maker, "initialize", AsyncMock()), \
+                patch.object(self.maker, "shutdown", AsyncMock()), \
+                patch.object(self.maker, "step", side_effect=step), \
+                patch.object(self.exchange, "active_orders", AsyncMock(side_effect=[
+                    ApiError("toujours indisponible"), await self.exchange.active_orders()])) as reads, \
+                patch.object(self.maker, "cancel_quotes", AsyncMock()) as cancel, \
+                patch.object(self.maker, "wait_for_retry", side_effect=wait), self.assertLogs("xau-mm"):
+            await self.maker.run()
+        self.assertEqual(delays, [90, 60, .5])
+        self.assertEqual(reads.await_count, 2)
+        cancel.assert_awaited_once()
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn("recovery_pending", self.maker.state)
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def check_returning_api_stop(self, side):
+        await self.start()
+        entry = self.quote(side)
+        self.exchange.fill(entry["id"])
+        # Le fill a eu lieu pendant la panne ; seul le compte le connaît.
+        self.maker.state["recovery_pending"] = True
+        for order in self.maker.live():
+            order["expires_at_ms"] = 1
+        self.exchange.rows.clear()
+        self.exchange.depth = (book("2999.45", "2999.55") if side == 1
+                               else book("3001.45", "3001.55"))
+        original_step = self.maker.step
+
+        async def step():
+            await original_step()
+            self.maker.stop.set()
+
+        with patch.object(self.maker, "initialize", AsyncMock()), \
+                patch.object(self.maker, "shutdown", AsyncMock()), \
+                patch.object(self.maker, "step", side_effect=step), \
+                patch.object(self.maker, "wait_for_retry", AsyncMock()):
+            await self.maker.run()
+        self.assertEqual(self.exchange.current["size"], 0)
+        self.assertEqual(len(self.exchange.sent), 3)
+        close = self.exchange.sent[-1]
+        self.assertEqual(close["kind"], "close")
+        self.assertTrue(close["reduce_only"])
+        self.assertEqual(close["side"], -side)
+        self.assertIn("api_orders_reconciled", self.path.with_suffix(".orders.jsonl").read_text())
+
+    async def test_returning_api_checks_long_stop_before_recreating_limit_exit(self):
+        await self.check_returning_api_stop(1)
+
+    async def test_returning_api_checks_short_stop_before_recreating_limit_exit(self):
+        await self.check_returning_api_stop(-1)
+
+    async def test_recovery_recreates_expired_limit_at_original_price(self):
+        await self.start()
+        bid, ask = self.quote(1), self.quote(-1)
+        self.exchange.fill(bid["id"], D(".0010"))
+        for order in self.maker.live():
+            order["expires_at_ms"] = 1
+        self.exchange.rows.clear()
+        self.exchange.depth = book("3000.47", "3000.57")
+        with patch.object(self.maker, "wait_for_retry", AsyncMock()):
+            await self.maker.recover_after_outage()
+        self.assertEqual(D(self.maker.state["expected_size"]), D(".0010"))
+        self.assertEqual(bid["filled"], "0")  # Aucun fill individuel inventé.
+        self.assertEqual(bid["status"], "ABSENT")
+        await self.maker.step()
+        exit_order = self.exchange.sent[-1]
+        self.assertEqual(exit_order["kind"], "quote")
+        self.assertTrue(exit_order["reduce_only"])
+        self.assertEqual(exit_order["price"], ask["price"])
+        self.assertEqual(len(self.exchange.sent), 3)
+
+    async def test_recovery_preserves_known_active_exit_and_counts_visible_fill(self):
+        await self.start()
+        bid, ask = self.quote(1), self.quote(-1)
+        self.exchange.fill(bid["id"])
+        bid["expires_at_ms"] = 1
+        del self.exchange.rows[bid["id"]]
+        with patch.object(self.maker, "wait_for_retry", AsyncMock()):
+            await self.maker.recover_after_outage()
+        await self.maker.step()
+        self.assertEqual(ask["status"], "OPEN")
+        self.assertEqual(len(self.exchange.sent), 2)
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_recovery_retains_missing_quotes_on_failed_or_changing_snapshot(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        flat = {"size": D(0), "entry": D(0)}
+        for second in (ApiError("HTML"), {"size": D(".0010"), "entry": D("3000.45")}):
+            with self.subTest(second=second):
+                before = deepcopy(self.maker.state)
+                with patch.object(self.exchange, "position", AsyncMock(side_effect=[flat, second])), \
+                        patch.object(self.maker, "wait_for_retry", AsyncMock()):
+                    with self.assertRaises((ApiError, UncertainOrder)):
+                        await self.maker.recover_after_outage()
+                self.assertEqual(self.maker.state, before)
+                self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.sent)
+
+    async def test_recovery_requires_expiry_and_never_discards_unknown_market_close(self):
+        order = self.seed_missing_quote(expires_at_ms=int(time.time() * 1000) + 60000)
+        for changes in ({}, {"expires_at_ms": 1, "kind": "close"}):
+            order.update(changes)
+            with self.assertRaises(UncertainOrder):
+                await self.maker.recover_after_outage()
+            self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.sent)
+        self.assertFalse(self.exchange.canceled)
+
+    async def test_recovery_refuses_inventory_outside_possible_missing_fills(self):
+        self.seed_missing_quote(expires_at_ms=1)
+        self.exchange.current = {"size": D(".1"), "entry": D("3000.45")}
+        with patch.object(self.maker, "wait_for_retry", AsyncMock()):
+            with self.assertRaises(ReadModelLag):
+                await self.maker.recover_after_outage()
+        self.assertEqual(self.maker.state["expected_size"], "0")
+
+    async def test_recovery_from_persisted_outage_after_restart(self):
+        self.seed_missing_quote(expires_at_ms=1)
+        self.maker.state["recovery_pending"] = True
+        self.maker.save()
+        restarted = MarketMaker(self.exchange, self.path)
+        with patch.object(restarted, "wait_for_retry", AsyncMock()):
+            await restarted.initialize()
+        self.assertTrue(restarted.initialized)
+        self.assertNotIn("recovery_pending", restarted.state)
+        await restarted.step()
+        self.assertEqual(len(self.exchange.sent), 2)
+
+    async def test_stop_during_api_recovery_preserves_missing_orders(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+        before = deepcopy(self.maker.state)
+        with patch.object(self.maker, "wait_for_retry", side_effect=lambda _: self.maker.stop.set()):
+            await self.maker.recover_after_outage()
+        self.assertEqual(self.maker.state, before)
+        self.assertEqual(order["status"], "PENDING")
+        self.assertFalse(self.exchange.sent)
+
+    async def test_legacy_outage_quotes_wait_six_minutes_and_recover_original_exit(self):
+        await self.start()
+        bid, ask = self.quote(1), self.quote(-1)
+        self.exchange.fill(bid["id"])
+        for order in self.maker.live():
+            order.pop("expires_at_ms")
+            order.pop("opposite_price")
+        self.exchange.rows.clear()
+        with self.assertRaises(UncertainOrder):
+            await self.maker.recover_after_outage()
+        self.assertGreater(self.maker.outage_legacy_deadline - time.monotonic(), 360)
+        self.maker.outage_legacy_deadline = 0
+        with patch.object(self.maker, "wait_for_retry", AsyncMock()):
+            await self.maker.recover_after_outage()
+        await self.maker.step()
+        self.assertEqual(self.exchange.sent[-1]["price"], ask["price"])
+        self.assertTrue(self.exchange.sent[-1]["reduce_only"])
+
+    async def test_late_visible_quote_is_not_archived_during_outage_recovery(self):
+        order = self.seed_missing_quote(expires_at_ms=1)
+
+        async def reappear(_):
+            self.exchange.rows[order["id"]] = {**deepcopy(order), "status": "OPEN"}
+
+        with patch.object(self.maker, "wait_for_retry", side_effect=reappear):
+            with self.assertRaises(UncertainOrder):
+                await self.maker.recover_after_outage()
+        self.assertEqual(order["status"], "OPEN")
+        self.assertFalse(self.exchange.sent)
+
+    async def test_refresh_records_visible_fills_even_when_first_quote_is_missing(self):
+        await self.start()
+        bid, ask = self.quote(1), self.quote(-1)
+        del self.exchange.rows[bid["id"]]
+        self.exchange.fill(ask["id"])
+        with self.assertRaises(UncertainOrder):
+            await self.maker.refresh()
+        self.assertEqual(D(self.maker.state["expected_size"]), self.exchange.current["size"])
 
     async def test_fill_during_cancellation_does_not_requote(self):
         await self.start()

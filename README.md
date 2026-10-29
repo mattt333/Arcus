@@ -128,7 +128,8 @@ les annulations et le stop interviennent au moment de l'observation.
 Un HTTP **429** suspend les lectures REST. Le délai respecte `Retry-After`
 (secondes ou date HTTP), avec un minimum progressif de **5, 10, 20, 40 puis
 60 secondes** si les refus se répètent ; une lecture réussie réinitialise ce
-minimum. Un `Retry-After` plus long est respecté. La boucle attend ce délai
+minimum. La boucle attend au moins **60 secondes** entre tentatives de reprise,
+et respecte un `Retry-After` plus long. Elle attend ce délai
 avant de reprendre, sans multiplier les lectures refusées. L'envoi d'une
 annulation reste tenté via le SDK, avec l'index serveur conservé dans le
 journal ou l'identifiant client ; elle reste incertaine jusqu'à une lecture
@@ -151,7 +152,18 @@ Il est remplacé atomiquement. Une réponse perdue ne provoque jamais un
 renvoi automatique du même placement. Tant que fills et position ne
 concordent pas, les nouvelles cotations restent suspendues.
 
-Les erreurs de lecture déclenchent une tentative d'annulation des quotes.
+Les erreurs de lecture (y compris une réponse HTML ou vide), les ordres
+incertains et les écarts persistants suspendent les cotations. Une première
+tentative d'annulation des quotes est effectuée, puis le bot vérifie le compte
+une fois par minute, sans répéter les annulations tant que cette vérification
+échoue. `recovery_pending` conserve cette suspension après un redémarrage.
+Une tentative peut comporter plusieurs lectures des ordres et de la position ;
+les temps réseau et les vérifications s'ajoutent aux 60 secondes d'attente.
+Après réconciliation, le bot vérifie d'abord le stop au prix courant : fermeture
+MARKET / IOC / reduce-only si le seuil est atteint, sinon conservation ou
+recréation de la sortie LIMIT / POST_ONLY au prix opposé d'origine. À plat,
+les cotations habituelles reprennent. Le stop reste indisponible pendant la panne.
+
 Au démarrage, le bot réconcilie le journal avec les ordres ouverts,
 l'historique et la position **sans envoyer d'annulation**. Les ordres
 réellement présents sont conservés, y compris l'ordre opposé à une position.
@@ -172,7 +184,7 @@ meilleur prix courant comme cible de remplacement.
 Un 429, une erreur de lecture, un ordre incertain ou un écart de position
 pendant l'initialisation suspend le démarrage dans le même processus, au
 lieu de provoquer des redémarrages systemd. Les vérifications sont retentées
-après **5, 10, 20, 40 puis 60 secondes**, ou après le délai REST s'il est plus
+après **60 secondes**, ou après le délai REST s'il est plus
 long. Un arrêt demandé interrompt cette attente. Les autres erreurs de
 configuration ou de compte restent bloquantes et provoquent un échec.
 En cas d'écart, le message indique la position signée sur Lighter et celle
@@ -182,6 +194,16 @@ ouverte nécessite de vérifier le compte et l'historique des exécutions.
 Pendant cette attente,
 aucune nouvelle cotation n'est envoyée et le stop n'est pas surveillé.
 Conserver le journal d'état pour permettre cette réconciliation.
+
+En fonctionnement, si les lectures des ordres et de la position divergent,
+le bot effectue jusqu'à **deux nouvelles vérifications**, chacune précédée
+d'une pause de **0,5 seconde** (auxquelles s'ajoutent les délais REST).
+Aucun nouvel ordre n'est envoyé pendant ces vérifications. Si les lectures
+se réconcilient, l'ordre opposé est conservé à son prix figé. Si l'écart
+persiste ou si une lecture échoue, les cotations sont suspendues et leur
+annulation est tentée. Ces situations produisent un avertissement concis ;
+les erreurs inattendues conservent leur pile d'appels. La vérification du
+stop reprend après réconciliation ; elle est retardée pendant ces lectures.
 
 Après une fermeture manuelle, si Lighter indique une position nulle mais
 que le journal attend encore une position, le démarrage vérifie deux fois
@@ -216,10 +238,10 @@ ordre ait jamais été créé sur Lighter. Si une quote est introuvable dans
 les ordres ouverts et l'historique, le bot attend son expiration plus
 5 secondes, puis relit le compte. Les nouvelles quotes conservent leur
 date d'expiration dans le journal avant envoi ; cette même date est transmise
-au SDK. Pour un ancien journal sans date d'expiration, le bot attend une fois
-**65 secondes après son démarrage**.
+au SDK. Lors de la première réconciliation d'un ancien journal sans date
+d'expiration, le bot attend une fois **65 secondes après son démarrage**.
 
-La référence peut alors être classée localement `ABSENT` uniquement si les
+Au démarrage initial, la référence peut être classée localement `ABSENT` si les
 deux lectures confirment qu'il n'y a aucun ordre ouvert ni aucune position,
 et si la position correspond à l'inventaire attendu, ou après la vérification
 de compte vide décrite pour une fermeture externe. Cette classification
@@ -227,10 +249,24 @@ est conservée dans l'état et l'audit ; elle ne prétend pas qu'une annulation
 ou un refus a été confirmé. Aucune annulation n'est envoyée pour cette référence.
 Le bot peut ensuite reprendre sans renommer ni supprimer le journal.
 
-Une position, un ordre actif, une fermeture MARKET incertaine ou une erreur
-de lecture bloque cette récupération automatique. Une erreur API ne vaut
-jamais absence d'ordre. Un arrêt demandé pendant l'attente interrompt la
-reprise sans supprimer la référence locale.
+Si la réconciliation initiale échoue ou après une panne en fonctionnement,
+la reprise traite aussi les quotes expirées introuvables avec une position ou
+des ordres connus encore actifs. Elle attend l'expiration plus 5 secondes
+(**365 secondes après le démarrage** pour une ancienne quote sans date),
+puis effectue deux lectures espacées de 5 secondes. La position et la liste des
+références manquantes doivent être stables. La position doit rester dans les
+bornes des exécutions possibles des quotes introuvables. Les fills connus sont
+conservés ; les références expirées deviennent `ABSENT` et l'inventaire attendu
+est ajusté à la position observée, sans inventer d'exécution individuelle.
+L'ajustement est enregistré dans `last_api_recovery` et l'événement d'audit
+`api_orders_reconciled`. Les sorties existantes sont suivies normalement.
+Si le fill d'entrée est introuvable, seul un prix opposé d'origine retrouvé
+sans ambiguïté permet de recréer la sortie limite ; le stop reste prioritaire.
+
+Une fermeture MARKET incertaine, un ordre externe, une position incompatible
+ou une erreur de lecture bloque la reprise. Une erreur API ne vaut jamais
+absence d'ordre. Un arrêt demandé pendant l'attente interrompt la reprise
+sans supprimer la référence locale.
 
 Le chemin absolu du journal effectivement utilisé est affiché au démarrage
 (`Journal XAU utilisé`). Il peut différer de `xau-mm-state.json` si le service
